@@ -10,7 +10,6 @@ import stat
 import subprocess
 import sys
 import time
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -18,20 +17,6 @@ import pytest
 import init
 
 REAL_REPO = Path(__file__).resolve().parent.parent
-
-
-@pytest.fixture(autouse=True)
-def isolate_home(tmp_path: Path) -> Iterator[Path]:
-    """Prevent any test from touching real home or host git/XDG configuration."""
-    guarded_home = tmp_path / "guarded_home"
-    guarded_home.mkdir()
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setenv("HOME", str(guarded_home))
-        mp.setenv("XDG_CONFIG_HOME", str(guarded_home / ".config"))
-        mp.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-        mp.setenv("GIT_CONFIG_NOSYSTEM", "1")
-        mp.setattr(Path, "home", classmethod(lambda cls: guarded_home))
-        yield guarded_home
 
 
 def _write_skill(
