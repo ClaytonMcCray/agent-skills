@@ -37,7 +37,12 @@ def _write_skill(
     return skill_dir
 
 
-def _make_fake_repo(repo_dir: Path, *, include_agy_skills: bool = True) -> Path:
+def _make_fake_repo(
+    repo_dir: Path,
+    *,
+    include_agy_skills: bool = True,
+    include_global_agents: bool = True,
+) -> Path:
     _write_skill(repo_dir / "shared" / "hey", description="Interact with HEY email.")
     if include_agy_skills:
         _write_skill(
@@ -48,6 +53,10 @@ def _make_fake_repo(repo_dir: Path, *, include_agy_skills: bool = True) -> Path:
             repo_dir / "harnesses" / "agy" / "dev-swarm",
             description="Run an autonomous multi-agent development swarm.",
         )
+    if include_global_agents:
+        global_dir = repo_dir / "global"
+        global_dir.mkdir(parents=True, exist_ok=True)
+        (global_dir / "AGENTS.md").write_text("# Global Agent Rules\n", encoding="utf-8")
     return repo_dir
 
 
@@ -106,10 +115,11 @@ def _snapshot_tree(root: Path) -> list[tuple[str, str, bytes | str]]:
 def test_shared_hey_verbatim_files() -> None:
     hey_dir = REAL_REPO / "shared" / "hey"
     expected = {
-        "SKILL.md": (47937, "83deb61c15f8256a"),
-        ".installed-version": (5, "e58bea78c28fe3de"),
+        "SKILL.md": (49317, "4e75060369cfa8fc"),
+        ".installed-version": (5, "1f4dc096d58f7d21"),
         ".managed-by-hey-cli": (79, "f8032ab559f099f8"),
     }
+    assert (hey_dir / ".installed-version").read_text(encoding="utf-8") == "1.5.0"
     actual_files = sorted(p.name for p in hey_dir.iterdir())
     assert actual_files == sorted(expected.keys())
     for filename, (exp_size, exp_prefix) in expected.items():
@@ -118,6 +128,20 @@ def test_shared_hey_verbatim_files() -> None:
         assert len(raw) == exp_size
         assert digest.startswith(exp_prefix)
     assert not (hey_dir / ".installed-version").read_bytes().endswith(b"\n")
+
+
+def test_pytest_collect_only_repo_root_ignores_shared_vendor_scripts() -> None:
+    res = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "."],
+        cwd=REAL_REPO,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, f"pytest --collect-only failed:\n{res.stdout}\n{res.stderr}"
+    assert "shared/mujoco-deformables" not in res.stdout
+    assert "ModuleNotFoundError" not in res.stdout
+    assert "ModuleNotFoundError" not in res.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +269,7 @@ def test_status_surfaces_regex_filtered_skills_and_bad_or_unreadable_ancestors(
     rc = init.main(["--repo", str(repo), "status", "--home", str(home)])
     out = capsys.readouterr().out
     assert rc == 0
+    assert "needs path normalization" in out
     assert "filtered out by include_only/exclude: dev-swarm, hey" in out
 
     bad_home = tmp_path / "bad_home"
@@ -297,8 +322,8 @@ def test_apply_home_relative_nonexistent_home_and_idempotent(tmp_path: Path) -> 
     rel_json = rel_home / ".gemini" / "config" / "skills.json"
     assert json.loads(rel_json.read_text(encoding="utf-8")) == {
         "entries": [
-            {"path": "~/projects/agent-skills/shared"},
-            {"path": "~/projects/agent-skills/harnesses/agy"},
+            {"path": (rel_repo / "shared").resolve().as_posix()},
+            {"path": (rel_repo / "harnesses" / "agy").resolve().as_posix()},
         ]
     }
     before_text = rel_json.read_text(encoding="utf-8")
@@ -337,12 +362,16 @@ def test_apply_non_destructive_skills_json_merge_utf8_and_double_slash_tilde(
     assert merged["inherits"] == existing["inherits"]
     assert merged["note"] == "café — 日本語"
     assert len(merged["entries"]) == 3
+    assert merged["entries"][0] == {
+        "path": (home / "custom" / "skills").resolve().as_posix(),
+        "include_only": ["foo"],
+    }
     assert merged["entries"][1] == {
-        "path": "~//projects/agent-skills/shared/",
+        "path": (repo / "shared").resolve().as_posix(),
         "exclude": ["beta"],
         "extra": True,
     }
-    assert merged["entries"][2] == {"path": "~/projects/agent-skills/harnesses/agy"}
+    assert merged["entries"][2] == {"path": (repo / "harnesses" / "agy").resolve().as_posix()}
 
 
 def test_apply_preserves_valid_symlinked_skills_json(tmp_path: Path) -> None:
@@ -365,8 +394,8 @@ def test_apply_preserves_valid_symlinked_skills_json(tmp_path: Path) -> None:
 
     merged = json.loads(dotfiles_target.read_text(encoding="utf-8"))
     assert [e["path"] for e in merged["entries"]] == [
-        "~/projects/agent-skills/shared",
-        "~/projects/agent-skills/harnesses/agy",
+        (repo / "shared").resolve().as_posix(),
+        (repo / "harnesses" / "agy").resolve().as_posix(),
     ]
 
 
@@ -1152,7 +1181,8 @@ def test_doctor_frontmatter_duplicates_symlink_skills_and_bad_containers(tmp_pat
 
     # Regular file at repo/shared or repo/harnesses must fail doctor
     bad_repo = tmp_path / "file_shared_repo"
-    bad_repo.mkdir()
+    (bad_repo / "global").mkdir(parents=True)
+    (bad_repo / "global" / "AGENTS.md").write_text("# Global\n", encoding="utf-8")
     (bad_repo / "shared").write_text("not-a-dir", encoding="utf-8")
     assert init.cmd_doctor(bad_repo) == 1
     (bad_repo / "shared").unlink()
@@ -1458,7 +1488,7 @@ def test_read_only_noexec_dirs_and_inaccessible_leaf_status(
         out = capsys.readouterr().out
         assert rc == 0
         assert "conflict (inaccessible:" in out
-        assert out.count("invalid (inaccessible:") == 2
+        assert out.count("invalid (inaccessible:") == 4
     finally:
         os.chmod(home_leaf / ".agents", 0o755)
         os.chmod(home_leaf / ".gemini" / "config", 0o755)
@@ -1599,3 +1629,552 @@ def test_doctor_rejects_non_dir_dot_and_chained_trailing_slash_links(tmp_path: P
     doc.unlink()
 
     assert init.cmd_doctor(repo) == 0
+
+
+# ---------------------------------------------------------------------------
+# skills.json normalization, global AGENTS.md, plugins & diff warnings
+# ---------------------------------------------------------------------------
+
+
+def test_skills_json_tilde_normalization_and_deduplication(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_fake_repo(home / "projects" / "agent-skills")
+    config_dir = home / ".gemini" / "config"
+    config_dir.mkdir(parents=True)
+    skills_json = config_dir / "skills.json"
+
+    # Case 1: Legacy {"entries": [{"path": "~/.agents/skills"}]}
+    skills_json.write_text(
+        json.dumps({"entries": [{"path": "~/.agents/skills"}]}, indent=2),
+        encoding="utf-8",
+    )
+    rc_status = init.main(["--repo", str(repo), "status", "--home", str(home)])
+    out_status = capsys.readouterr().out
+    assert rc_status == 0
+    assert "needs path normalization" in out_status
+    assert "missing entries" in out_status
+
+    # Dry-run mutates nothing and evaluates explicit repo targets
+    before = _snapshot_tree(home)
+    assert init.main(["--repo", str(repo), "apply", "--dry-run", "--home", str(home)]) == 0
+    assert _snapshot_tree(home) == before
+
+    # Live apply links ~/.agents/skills -> shared and normalizes without duplication
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    data = json.loads(skills_json.read_text(encoding="utf-8"))
+    shared_abs = (repo / "shared").resolve().as_posix()
+    agy_abs = (repo / "harnesses" / "agy").resolve().as_posix()
+    assert data["entries"] == [{"path": shared_abs}, {"path": agy_abs}]
+    assert all(e["path"].startswith("/") for e in data["entries"])
+
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_after = capsys.readouterr().out
+    assert "needs path normalization" not in out_after
+    assert ": configured" in out_after
+
+    # Case 2: Deduplicate ~/.agents/skills + explicit shared, keep distinct filters, ~ & ~otheruser
+    skills_json.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"path": "~"},
+                    {"path": "~otheruser/skills"},
+                    {"path": "~/.agents/skills"},
+                    {"path": shared_abs},
+                    {"path": "~/.agents/skills", "exclude": ["hey"]},
+                    {"path": "~/extra/custom", "include_only": ["my-skill"]},
+                    {"path": "~/extra/custom", "include_only": ["my-skill"]},
+                    {"path": agy_abs},
+                ]
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    merged = json.loads(skills_json.read_text(encoding="utf-8"))
+    assert merged["entries"] == [
+        {"path": home.resolve().as_posix()},
+        {"path": "~otheruser/skills"},
+        {"path": shared_abs},
+        {"path": shared_abs, "exclude": ["hey"]},
+        {"path": (home / "extra" / "custom").resolve().as_posix(), "include_only": ["my-skill"]},
+        {"path": agy_abs},
+    ]
+
+    # Case 3: 2-step apply (conflict on real ~/.agents/skills) -> apply --replace deduplicates
+    home_2step = tmp_path / "home_2step"
+    _write_skill(home_2step / ".agents" / "skills" / "hey", description="Old local hey.")
+    cfg_2step = home_2step / ".gemini" / "config"
+    cfg_2step.mkdir(parents=True)
+    sj_2step = cfg_2step / "skills.json"
+    sj_2step.write_text(json.dumps({"entries": [{"path": "~/.agents/skills"}]}), encoding="utf-8")
+
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home_2step)]) == 1
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home_2step)]) == 0
+    data_2step = json.loads(sj_2step.read_text(encoding="utf-8"))
+    assert data_2step["entries"] == [{"path": shared_abs}, {"path": agy_abs}]
+
+    # Case 4: Pre-existing absolute <home>/.agents/skills alias canonicalizes to <repo>/shared
+    sj_2step.write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"path": (home_2step / ".agents" / "skills").as_posix()},
+                    {"path": agy_abs},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home_2step)]) == 0
+    assert "needs path normalization" in capsys.readouterr().out
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home_2step)]) == 0
+    assert json.loads(sj_2step.read_text(encoding="utf-8"))["entries"] == [
+        {"path": shared_abs},
+        {"path": agy_abs},
+    ]
+
+    # Case 5: --dry-run --replace and live --replace agree when ~/.agents/skills excludes 'hey'
+    home_parity = tmp_path / "home_parity"
+    _write_skill(home_parity / ".agents" / "skills" / "hey", description="Local hey.")
+    cfg_parity = home_parity / ".gemini" / "config"
+    cfg_parity.mkdir(parents=True)
+    (cfg_parity / "skills.json").write_text(
+        json.dumps({"entries": [{"path": "~/.agents/skills", "exclude": ["hey"]}]}),
+        encoding="utf-8",
+    )
+    _write_skill(cfg_parity / "skills" / "hey", description="Shadow hey.")
+
+    before_parity = _snapshot_tree(home_parity)
+    rc_dry_p = init.main(
+        ["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home_parity)]
+    )
+    err_dry_p = capsys.readouterr().err
+    assert rc_dry_p == 1
+    assert "filters out 'hey'" in err_dry_p
+    assert _snapshot_tree(home_parity) == before_parity
+
+    rc_live_p = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home_parity)])
+    err_live_p = capsys.readouterr().err
+    assert rc_live_p == 1
+    assert "filters out 'hey'" in err_live_p
+    assert (cfg_parity / "skills" / "hey" / "SKILL.md").is_file()
+
+
+def test_global_agents_symlink_conflicts_replace_rollback_and_opt_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_fake_repo(home / "projects" / "agent-skills")
+    agents_md = home / ".gemini" / "config" / "AGENTS.md"
+    expected_target = (repo / "global" / "AGENTS.md").resolve()
+
+    # Initial status reports not installed
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert "~/.gemini/config/AGENTS.md" in out and "not installed" in out
+
+    # --no-global-agents and --skip-global-agents skip installation when missing
+    for flag in ("--no-global-agents", "--skip-global-agents"):
+        assert init.main(["--repo", str(repo), "apply", flag, "--home", str(home)]) == 0
+        assert not agents_md.exists() and not agents_md.is_symlink()
+
+    # Normal apply creates symlink and is idempotent
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    assert agents_md.is_symlink()
+    assert agents_md.resolve() == expected_target
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert f"ok (symlink -> {expected_target})" in capsys.readouterr().out
+
+    # Regular file conflict: fails without --replace, untouched under --no-global-agents --replace
+    agents_md.unlink()
+    agents_md.write_text("# Custom local rules\n", encoding="utf-8")
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert "conflict (regular file;" in capsys.readouterr().out
+
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 1
+    err = capsys.readouterr().err
+    assert "CONFLICT:" in err and "--no-global-agents" in err
+    assert not agents_md.is_symlink()
+    assert agents_md.read_text(encoding="utf-8") == "# Custom local rules\n"
+
+    for flag in ("--no-global-agents", "--skip-global-agents"):
+        rc_skip = init.main(
+            ["--repo", str(repo), "apply", "--replace", flag, "--home", str(home)]
+        )
+        assert rc_skip == 0
+        assert not agents_md.is_symlink()
+        assert agents_md.read_text(encoding="utf-8") == "# Custom local rules\n"
+        assert list((home / ".gemini" / "config").glob("AGENTS.md.bak.*")) == []
+
+    # Dry-run --replace leaves regular file untouched
+    before = _snapshot_tree(home)
+    assert (
+        init.main(["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home)])
+        == 0
+    )
+    assert _snapshot_tree(home) == before
+
+    # Rollback restores original file if symlink_to fails
+    with monkeypatch.context() as m:
+        real_symlink = Path.symlink_to
+
+        def fail_agents_md_symlink(self: Path, target: Path) -> None:
+            if self == agents_md:
+                raise OSError("simulated agents.md symlink failure")
+            real_symlink(self, target)
+
+        m.setattr(Path, "symlink_to", fail_agents_md_symlink)
+        assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 1
+        assert not agents_md.is_symlink()
+        assert agents_md.read_text(encoding="utf-8") == "# Custom local rules\n"
+
+    # Real --replace backs up regular file and links global/AGENTS.md
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 0
+    assert agents_md.is_symlink()
+    assert agents_md.resolve() == expected_target
+    backups = list((home / ".gemini" / "config").glob("AGENTS.md.bak.*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "# Custom local rules\n"
+
+    # Wrong/broken symlink at AGENTS.md is reported in status and replaced under --replace
+    other_rules = tmp_path / "other_rules.md"
+    other_rules.write_text("# Other\n", encoding="utf-8")
+    agents_md.unlink()
+    agents_md.symlink_to(other_rules)
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert "conflict (symlink ->" in capsys.readouterr().out
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 0
+    assert agents_md.resolve() == expected_target
+    assert other_rules.read_text(encoding="utf-8") == "# Other\n"
+
+    agents_md.unlink()
+    agents_md.symlink_to(tmp_path / "dangling_rules.md")
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert "conflict (broken or circular symlink ->" in capsys.readouterr().out
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 0
+    assert agents_md.resolve() == expected_target
+
+
+def test_agy_plugin_shadow_detection_backup_unmigrated_refusal_and_marketplace_skip(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_fake_repo(home / "projects" / "agent-skills")
+    config_dir = home / ".gemini" / "config"
+    plugins_dir = config_dir / "plugins"
+
+    # Marketplace plugin with colliding skill name must be ignored
+    config_dir.mkdir(parents=True)
+    (config_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "plugins": {
+                    "robotics": {"installedFrom": "antigravity-marketplace"},
+                    "dev-swarm": {"installedFrom": ""},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_skill(plugins_dir / "robotics" / "skills" / "review", description="Marketplace review.")
+
+    # Non-marketplace plugin whose skills are all in repo
+    _write_skill(plugins_dir / "dev-swarm" / "skills" / "dev-swarm", description="Local swarm.")
+    _write_skill(plugins_dir / "dev-swarm" / "skills" / "review", description="Local review.")
+
+    # Non-marketplace plugin containing an unmigrated extra skill
+    _write_skill(plugins_dir / "mixed" / "skills" / "hey", description="Local hey.")
+    _write_skill(plugins_dir / "mixed" / "skills" / "custom-unmigrated", description="Unmigrated.")
+
+    # Status detects dev-swarm & mixed, skips marketplace robotics
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert "dev-swarm: dev-swarm, review" in out
+    assert "mixed: hey (unmigrated: custom-unmigrated)" in out
+    assert "robotics" not in out
+
+    # Apply without --replace warns and returns 0, leaving plugins intact
+    rc_warn = init.main(["--repo", str(repo), "apply", "--home", str(home)])
+    err_warn = capsys.readouterr().err
+    assert rc_warn == 0
+    assert "WARNING: local plugins" in err_warn
+    assert "dev-swarm" in err_warn and "mixed" in err_warn
+    assert "robotics" not in err_warn
+    assert (plugins_dir / "dev-swarm").is_dir()
+    assert (plugins_dir / "mixed").is_dir()
+
+    # Dry-run --replace refuses mixed (exits 1) without modifying anything
+    before_dry = _snapshot_tree(home)
+    rc_dry = init.main(
+        ["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home)]
+    )
+    err_dry = capsys.readouterr().err
+    assert rc_dry == 1
+    assert "unmigrated skills not in repo: custom-unmigrated" in err_dry
+    assert _snapshot_tree(home) == before_dry
+
+    # Live --replace backs up dev-swarm, refuses mixed, and preserves marketplace robotics
+    rc_rep = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)])
+    err_rep = capsys.readouterr().err
+    assert rc_rep == 1
+    assert "unmigrated skills not in repo: custom-unmigrated" in err_rep
+    assert not (plugins_dir / "dev-swarm").exists()
+    assert (plugins_dir / "mixed" / "skills" / "custom-unmigrated" / "SKILL.md").is_file()
+    assert (plugins_dir / "robotics" / "skills" / "review" / "SKILL.md").is_file()
+    plugin_backups = list(config_dir.glob("plugins.bak.*"))
+    assert len(plugin_backups) == 1
+    assert (plugin_backups[0] / "dev-swarm" / "skills" / "dev-swarm" / "SKILL.md").is_file()
+
+    # If only mixed remains and --replace fails, no empty plugins.bak.* directory is left behind
+    before_bak_count = len(list(config_dir.glob("plugins.bak.*")))
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 1
+    assert len(list(config_dir.glob("plugins.bak.*"))) == before_bak_count
+
+    # Removing mixed leaves only marketplace robotics -> status reports no shadowing collisions
+    for child in sorted((plugins_dir / "mixed").rglob("*"), reverse=True):
+        if child.is_file() or child.is_symlink():
+            child.unlink()
+        else:
+            child.rmdir()
+    (plugins_dir / "mixed").rmdir()
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert "~/.gemini/config/plugins" in capsys.readouterr().out
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 0
+    assert (plugins_dir / "robotics" / "skills" / "review" / "SKILL.md").is_file()
+
+    # Guard: plugin must not be moved if skills.json filters out one of its colliding skills
+    home2 = tmp_path / "home2"
+    cfg2 = home2 / ".gemini" / "config"
+    cfg2.mkdir(parents=True)
+    (cfg2 / "skills.json").write_text(
+        json.dumps(
+            {
+                "entries": [
+                    {"path": (repo / "shared").resolve().as_posix()},
+                    {
+                        "path": (repo / "harnesses" / "agy").resolve().as_posix(),
+                        "exclude": ["review"],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_skill(cfg2 / "plugins" / "local-p" / "skills" / "review", description="Shadow.")
+    rc_filt = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home2)])
+    err_filt = capsys.readouterr().err
+    assert rc_filt == 1
+    assert "filters out 'review'" in err_filt
+    assert (cfg2 / "plugins" / "local-p" / "skills" / "review" / "SKILL.md").is_file()
+    assert list(cfg2.glob("plugins.bak.*")) == []
+
+    # Guard: malformed/corrupt config.json fails closed so marketplace plugins are never moved
+    home3 = tmp_path / "home3"
+    cfg3 = home3 / ".gemini" / "config"
+    cfg3.mkdir(parents=True)
+    _write_skill(cfg3 / "plugins" / "robotics" / "skills" / "review", description="Marketplace.")
+    for bad_cfg in ("{invalid json", "[]", '{"plugins": "not-a-dict"}', '{"plugins": {"a": 1}}'):
+        (cfg3 / "config.json").write_text(bad_cfg, encoding="utf-8")
+        capsys.readouterr()
+        assert init.main(["--repo", str(repo), "status", "--home", str(home3)]) == 0
+        assert "~/.gemini/config/plugins" in capsys.readouterr().out
+        rc_bad_cfg = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home3)])
+        assert rc_bad_cfg == 1
+        assert (cfg3 / "plugins" / "robotics" / "skills" / "review" / "SKILL.md").is_file()
+        assert list(cfg3.glob("plugins.bak.*")) == []
+
+    (cfg3 / "config.json").unlink()
+    (cfg3 / "config.json").symlink_to(tmp_path / "missing_config.json")
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home3)]) == 1
+    assert (cfg3 / "plugins" / "robotics" / "skills" / "review" / "SKILL.md").is_file()
+    assert list(cfg3.glob("plugins.bak.*")) == []
+
+
+def test_agy_plugin_shadow_guards_runtime_components_while_allowing_agents_rules_assets(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_fake_repo(home / "projects" / "agent-skills")
+    config_dir = home / ".gemini" / "config"
+    plugins_dir = config_dir / "plugins"
+
+    # Plugin with agents/, rules/, assets/, and only migrated skills backs up cleanly.
+    dev_swarm = plugins_dir / "dev-swarm"
+    _write_skill(dev_swarm / "skills" / "dev-swarm", description="Local swarm.")
+    _write_skill(dev_swarm / "skills" / "review", description="Local review.")
+    (dev_swarm / "plugin.json").write_text('{"name": "dev-swarm"}\n', encoding="utf-8")
+    (dev_swarm / "agents").mkdir()
+    (dev_swarm / "agents" / "helper.md").write_text("# Helper\n", encoding="utf-8")
+    (dev_swarm / "rules").mkdir()
+    (dev_swarm / "rules" / "AGENTS.md").write_text("# Local rule\n", encoding="utf-8")
+    (dev_swarm / "assets").mkdir()
+    (dev_swarm / "assets" / "icon.txt").write_text("icon\n", encoding="utf-8")
+
+    # Plugins bundling mcp_config.json, hooks.json, or sidecars/ must not be moved wholesale.
+    mcp_kit = plugins_dir / "mcp-kit"
+    _write_skill(mcp_kit / "skills" / "review", description="Local review.")
+    (mcp_kit / "plugin.json").write_text('{"name": "mcp-kit"}\n', encoding="utf-8")
+    (mcp_kit / "mcp_config.json").write_text('{"mcpServers": {}}\n', encoding="utf-8")
+
+    hooks_kit = plugins_dir / "hooks-kit"
+    _write_skill(hooks_kit / "skills" / "hey", description="Local hey.")
+    (hooks_kit / "hooks.json").write_text('{"hooks": []}\n', encoding="utf-8")
+
+    sidecar_kit = plugins_dir / "sidecar-kit"
+    _write_skill(sidecar_kit / "skills" / "dev-swarm", description="Local swarm.")
+    (sidecar_kit / "sidecars").mkdir()
+    (sidecar_kit / "sidecars" / "worker.json").write_text("{}\n", encoding="utf-8")
+
+    # Status reports non-skill components on runtime-bundled plugins, not on dev-swarm.
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_status = capsys.readouterr().out
+    assert (
+        "dev-swarm: dev-swarm, review;" in out_status
+        or "dev-swarm: dev-swarm, review)" in out_status
+    )
+    assert "mcp-kit: review (non-skill components: mcp_config.json)" in out_status
+    assert "hooks-kit: hey (non-skill components: hooks.json)" in out_status
+    assert "sidecar-kit: dev-swarm (non-skill components: sidecars)" in out_status
+
+    # Dry-run --replace refuses the runtime-component plugins without touching disk.
+    before = _snapshot_tree(home)
+    rc_dry = init.main(
+        ["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home)]
+    )
+    err_dry = capsys.readouterr().err
+    assert rc_dry == 1
+    assert "non-skill runtime components: mcp_config.json" in err_dry
+    assert "non-skill runtime components: hooks.json" in err_dry
+    assert "non-skill runtime components: sidecars" in err_dry
+    assert _snapshot_tree(home) == before
+
+    # Live --replace backs up dev-swarm cleanly while leaving runtime-component plugins intact.
+    rc_live = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)])
+    err_live = capsys.readouterr().err
+    assert rc_live == 1
+    assert "non-skill runtime components: mcp_config.json" in err_live
+    assert "non-skill runtime components: hooks.json" in err_live
+    assert "non-skill runtime components: sidecars" in err_live
+    assert not dev_swarm.exists()
+    assert (mcp_kit / "mcp_config.json").is_file()
+    assert (hooks_kit / "hooks.json").is_file()
+    assert (sidecar_kit / "sidecars" / "worker.json").is_file()
+    backups = list(config_dir.glob("plugins.bak.*"))
+    assert len(backups) == 1
+    assert (backups[0] / "dev-swarm" / "skills" / "dev-swarm" / "SKILL.md").is_file()
+    assert (backups[0] / "dev-swarm" / "agents" / "helper.md").is_file()
+
+    # Re-running --replace with only refused plugins left creates no empty plugins.bak.* directory.
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 1
+    assert len(list(config_dir.glob("plugins.bak.*"))) == 1
+
+
+def test_agents_skills_diff_warning_in_status_and_apply(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_fake_repo(home / "projects" / "agent-skills")
+    local_hey = home / ".agents" / "skills" / "hey"
+    _write_skill(local_hey, description="Interact with HEY email.")
+
+    # Identical tree (plus pruned .DS_Store) produces no diff warning
+    (local_hey / ".DS_Store").write_bytes(b"junk")
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_same = capsys.readouterr().out
+    assert "differs from repo shared/" not in out_same
+
+    assert (
+        init.main(["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home)])
+        == 0
+    )
+    err_same = capsys.readouterr().err
+    assert "differ from repo shared/" not in err_same
+
+    # Executable bit change on a script file also triggers diff detection
+    repo_script = repo / "shared" / "hey" / "run.py"
+    local_script = local_hey / "run.py"
+    repo_script.write_text("print('ok')\n", encoding="utf-8")
+    local_script.write_text("print('ok')\n", encoding="utf-8")
+    os.chmod(repo_script, 0o644)
+    os.chmod(local_script, 0o755)
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert "differs from repo shared/: hey" in capsys.readouterr().out
+    os.chmod(local_script, 0o644)
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert "differs from repo shared/" not in capsys.readouterr().out
+
+    # Modifying non-pruned metadata (.installed-version) also triggers diff detection
+    (repo / "shared" / "hey" / ".installed-version").write_text("1.4.3", encoding="utf-8")
+    (local_hey / ".installed-version").write_text("1.5.0", encoding="utf-8")
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    assert "differs from repo shared/: hey" in capsys.readouterr().out
+
+    # Modifying SKILL.md surfaces diff warning in both status and apply --replace
+    _write_skill(local_hey, description="Newer local HEY skill.")
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_diff = capsys.readouterr().out
+    assert "differs from repo shared/: hey" in out_diff
+
+    rc_rep = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)])
+    err_diff = capsys.readouterr().err
+    assert rc_rep == 0
+    assert "differ from repo shared/: hey" in err_diff
+    assert (home / ".agents" / "skills").resolve() == (repo / "shared").resolve()
+
+
+def test_doctor_validates_global_agents_md(tmp_path: Path) -> None:
+    # Missing global/AGENTS.md fails doctor
+    repo_missing = _make_fake_repo(tmp_path / "missing_repo", include_global_agents=False)
+    assert init.cmd_doctor(repo_missing) == 1
+
+    # Valid global/AGENTS.md at exact 24,000-byte boundary passes
+    repo = _make_fake_repo(tmp_path / "valid_repo")
+    agents_md = repo / "global" / "AGENTS.md"
+    agents_md.write_bytes(b"a" * init.GLOBAL_AGENTS_MAX_BYTES)
+    assert init.cmd_doctor(repo) == 0
+
+    # Oversized (> 24,000 bytes) fails, including multi-byte UTF-8 boundary
+    agents_md.write_bytes(b"a" * (init.GLOBAL_AGENTS_MAX_BYTES + 1))
+    assert init.cmd_doctor(repo) == 1
+    agents_md.write_text("é" * 12_000, encoding="utf-8")
+    assert init.cmd_doctor(repo) == 0
+    agents_md.write_text("é" * 12_001, encoding="utf-8")
+    assert init.cmd_doctor(repo) == 1
+
+    # Empty / whitespace-only fails
+    agents_md.write_text("   \n\t\n", encoding="utf-8")
+    assert init.cmd_doctor(repo) == 1
+
+    # Non-UTF-8 bytes fail
+    agents_md.write_bytes(b"\xff\xfe\x00invalid")
+    assert init.cmd_doctor(repo) == 1
+
+    # Symlinked global/AGENTS.md fails
+    agents_md.unlink()
+    (repo / "global" / "real.md").write_text("# Real\n", encoding="utf-8")
+    agents_md.symlink_to("real.md")
+    assert init.cmd_doctor(repo) == 1
+    agents_md.unlink()
+    (repo / "global" / "real.md").unlink()
+
+    # Symlinked global/ container fails
+    (repo / "global").rmdir()
+    ext_global = tmp_path / "ext_global"
+    ext_global.mkdir()
+    (ext_global / "AGENTS.md").write_text("# External\n", encoding="utf-8")
+    (repo / "global").symlink_to(ext_global)
+    assert init.cmd_doctor(repo) == 1

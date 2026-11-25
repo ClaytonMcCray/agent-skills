@@ -824,7 +824,7 @@ def test_git_config_adversaries_nonutf8_filter_fifos_global_ignore_and_cquoted_p
     cfg_bytes += (
         f'\n[filter "a=b"]\n\tclean = "{evil_script}"\n\tsmudge = "{evil_script}"\n'
         f'\tprocess = "{evil_script}"\n\trequired = true\n'
-    ).encode("utf-8")
+    ).encode()
     cfg_bytes += (
         b'\n[filter "bad\xffname"]\n\tclean = "'
         + str(evil_script).encode("utf-8")
@@ -839,7 +839,7 @@ def test_git_config_adversaries_nonutf8_filter_fifos_global_ignore_and_cquoted_p
         f'[mailmap]\n\tfile = "{mailmap_fifo}"\n'
         f'[gpg]\n\tprogram = "{evil_script}"\n'
         "[format]\n\tpretty = format:--- a/spoof.rs%n+++ b/spoof.rs%n@@ -1 +1 @@%n+unsafe {}%n\n"
-    ).encode("utf-8")
+    ).encode()
     cfg_path.write_bytes(cfg_bytes)
 
     # Also test GIT_CONFIG=/dev/null bypass attempt + preserved safe global excludesFile
@@ -854,7 +854,7 @@ def test_git_config_adversaries_nonutf8_filter_fifos_global_ignore_and_cquoted_p
     )
     assert not marker.exists(), "hostile filter, diff.external, textconv, or gpg.program executed"
     assert kv_init["REVIEW_SCOPE"] == "initial-commit (HEAD)"
-    assert "--- a/spoof.rs".encode("utf-8") not in (sdir_init / "diff.patch").read_bytes()
+    assert b"--- a/spoof.rs" not in (sdir_init / "diff.patch").read_bytes()
     assert "skip.globally_ignored" not in (sdir_init / "untracked_files.txt").read_text(
         encoding="utf-8"
     )
@@ -1229,13 +1229,16 @@ def test_review_skill_artifacts_token_isolation_and_adapter_contract() -> None:
     }
     assert set(scanned_files) == expected_core
 
-    # Verify scope-discipline, threat-model calibration, and right-sized tiering invariants
+    # Verify scope, threat-model calibration, cross-model, and systems-boundary invariants
     algo_text = (core_dir / "algorithm.md").read_text(encoding="utf-8")
     assert "Out-of-Scope Notes" in algo_text
     assert "Small Diff" in algo_text and "Standard Diff" in algo_text and "Large Diff" in algo_text
     assert "Direct Delta Check" in algo_text and "No Goalpost-Moving" in algo_text
+    assert "Cross-Model Review Guarantee" in algo_text
+    assert "Small diffs" in adapter_text and "Cross-model review guarantee" in adapter_text
     sec_adv_text = (core_dir / "playbooks" / "security-adversarial.md").read_text(encoding="utf-8")
     assert "Local Developer CLI" in sec_adv_text and "Proportional" in sec_adv_text
+    assert "IPC/RPC" in sec_adv_text and "double-fetch" in sec_adv_text
     for path in scanned_files:
         text = path.read_text(encoding="utf-8").replace("agy-review.", "<TMP_PREFIX>")
         for label, pattern in forbidden_patterns:
@@ -1305,16 +1308,22 @@ def test_global_relative_and_superseded_excludes_preview_crlf_utf8_chunk_split_a
     assert crc._trim_incomplete_utf8(b"abc\xe2\x82", next_byte=0xAC) == b"abc"
     assert crc._trim_incomplete_utf8(b"abc\xc3\xa9", next_byte=ord("z")) == b"abc\xc3\xa9"
 
-    # 4. 64 KiB chunk-boundary identifier split: `unsafe_fn` must NOT trigger; `unsafe {}` MUST
+    # 4. 64 KiB chunk-boundary identifier split: `unsafe_fn` / `my_ioctl(` must NOT trigger
     chunk_repo = _init_git_repo(tmp_path / "chunk_repo")
     (chunk_repo / "false_split.rs").write_bytes((b" " * 65530) + b"unsafe_fn();\n")
+    (chunk_repo / "false_ffi_split.py").write_bytes(
+        (b" " * 65469) + b"my_ioctl(1);" + (b" " * 60) + b"\n"
+    )
     _, kv_false, _ = _run_ok(["--repo", str(chunk_repo)], tmp_path=tmp_path)
     assert kv_false["HAS_RUST"] == "1"
     assert kv_false["HAS_RUST_UNSAFE"] == "0"
+    assert kv_false["HAS_FFI"] == "0"
 
     (chunk_repo / "true_split.rs").write_bytes((b" " * 65530) + b"unsafe {}\n")
+    (chunk_repo / "true_ffi_split.py").write_bytes((b" " * 65533) + b"ioctl(fd, req)\n")
     _, kv_true, _ = _run_ok(["--repo", str(chunk_repo)], tmp_path=tmp_path)
     assert kv_true["HAS_RUST_UNSAFE"] == "1"
+    assert kv_true["HAS_FFI"] == "1"
 
     # 5. Uppercase C/C++/Rust suffixes (.CPP, .H, .RS) in files and diffs
     upper_repo = _init_git_repo(tmp_path / "upper_repo")
@@ -1330,3 +1339,41 @@ def test_global_relative_and_superseded_excludes_preview_crlf_utf8_chunk_split_a
     assert kv_up["HAS_CPP"] == "1"
     assert kv_up["HAS_RUST"] == "1"
     assert kv_up["HAS_RUST_UNSAFE"] == "1"
+
+
+def test_systems_syscall_ipc_hazard_markers_without_prose_false_positives(tmp_path: Path) -> None:
+    repo = _init_git_repo(tmp_path / "sys_repo")
+    (repo / "README.md").write_text(
+        "Kernel drivers call ioctl(fd, req), syscall(nr), mmap(addr), copy_from_user(d, s, n).\n",
+        encoding="utf-8",
+    )
+    (repo / "benign.py").write_text(
+        "# Avoid raw mmap, ioctl, syscall, mprotect, copy_from_user, or copy_to_user.\n"
+        "syscall_count = 0\n"
+        "mmap_offset = 4096\n"
+        "def my_ioctl(x: int) -> int:\n"
+        "    return x + 1\n"
+        "val = my_ioctl(1)\n",
+        encoding="utf-8",
+    )
+    _commit_all(repo, "init benign")
+
+    sdir_clean, kv_clean, _ = _run_ok(["--repo", str(repo)], tmp_path=tmp_path)
+    assert kv_clean["HAS_FFI"] == "0"
+    assert (sdir_clean / "hazard_hits.txt").read_text(encoding="utf-8") == ""
+
+    (repo / "sys_bridge.py").write_text(
+        "import fcntl, mmap\n"
+        "fcntl.ioctl(fd, req)\n"
+        "mmap.mmap(fd, 4096)\n"
+        "mprotect(addr, 4096, prot)\n"
+        "syscall(nr, arg)\n"
+        "copy_from_user(dst, src, n)\n"
+        "copy_to_user(dst, src, n)\n",
+        encoding="utf-8",
+    )
+    sdir_hit, kv_hit, _ = _run_ok(["--repo", str(repo)], tmp_path=tmp_path)
+    assert kv_hit["HAS_FFI"] == "1"
+    hits = (sdir_hit / "hazard_hits.txt").read_text(encoding="utf-8").splitlines()
+    assert len(hits) == 6
+    assert all(line.startswith("sys_bridge.py:") for line in hits)

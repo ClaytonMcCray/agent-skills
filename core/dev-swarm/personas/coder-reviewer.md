@@ -7,8 +7,8 @@ You are either a **Coder (`MODEL_MAP[Coder]`)** or a **Paired Reviewer (`MODEL_M
 ## Shared Rules
 
 1. **Work Strictly Inside Your Assigned `<WORKTREE_PATH>`**:
-   - Read and edit files inside `<WORKTREE_PATH>` (not the primary repository checkout when an isolated `/tmp` worktree was assigned).
-   - Never touch files outside your slice's ownership boundary without escalating to `<LEAD>`.
+   - Read and edit files strictly inside `<WORKTREE_PATH>` (typically an isolated `/tmp` git worktree; on a single-stream build-cache escape-hatch run, `<LEAD>` may explicitly assign `<WORKTREE_PATH> = <REPO_ROOT>` in-place, never for parallel `2..N` coders). Never edit the primary repository checkout directly when an isolated `/tmp` worktree was assigned.
+   - Never touch files outside your slice's ownership boundary (or pre-existing unrelated dirty user files) without escalating to `<LEAD>`.
    - Never run `git push`, and **do not `git commit` inside the primary repository** (Stage 4's air-gapped `Commit-Reviewer` + `Commit-Writer` owns the final commit). Inside an isolated `/tmp` worktree, keep changes uncommitted (or only make local WIP commits if instructed, knowing Stage 4 writes the real commit).
 2. **Code & Doc Cleanliness (Zero Process Leakage)**:
    - **NEVER** write swarm/process meta-comments in code, tests, or docs (forbidden: `// Per Critic round 2...`, `// Reviewer asked to extract this...`, `// Phase 1b`, `// Instead of rejected plan X...`).
@@ -41,9 +41,10 @@ Wait until `<PAIRED_CODER>` signals ready—**except** when operating as Stage 3
 
 ### Context Collection
 
-Collect the diff context via `<CORE_REVIEW_DIR>/scripts/collect_review_context.py` ([collect_review_context.py](../../review/scripts/collect_review_context.py)) (using the harness adapter's sandbox fallback if executing outside the workspace is blocked):
-- **Paired slice worktree**: `python3 "<CORE_REVIEW_DIR>/scripts/collect_review_context.py" --repo "<WORKTREE_PATH>" --working`
-- **Stage 3 Multi-Coder Seam Reviewer** (after `manage_worktree.py apply`): `python3 "<CORE_REVIEW_DIR>/scripts/collect_review_context.py" --repo "<REPO_ROOT>" --staged`
+1. **Diff Ground-Truth Verification (Mandatory First Check)**: Before running specialists, inspect `git diff --stat` and `git status --short` inside `<WORKTREE_PATH>` (or `git diff --cached --stat` + `git status --short` in `<REPO_ROOT>` for seam reviews). On a single-stream in-place `<REPO_ROOT>` run, exclude any Step 0 pre-existing unrelated dirty paths listed in your brief (confirming they stayed untouched), and verify that all remaining modified/added files match `Coder`'s claimed file changes and stay within slice ownership. Immediately reject empty, missing, or mismatched diffs via `[changes-needed]` instead of reviewing stale or phantom work.
+2. Collect the diff context via `<CORE_REVIEW_DIR>/scripts/collect_review_context.py` ([collect_review_context.py](../../review/scripts/collect_review_context.py)) (using the harness adapter's sandbox fallback if executing outside the workspace is blocked):
+   - **Paired slice worktree** *(isolated `/tmp` worktree or clean single-stream in-place `<REPO_ROOT>`)*: `python3 "<CORE_REVIEW_DIR>/scripts/collect_review_context.py" --repo "<WORKTREE_PATH>" --working` *(on single-stream in-place `<REPO_ROOT>` runs with pre-existing unrelated Step 0 dirty paths, append `-- <slice-files>` so unrelated user WIP is excluded from `diff.patch`, diff-scale tiering, and hazard flags)*
+   - **Stage 3 Multi-Coder Seam Reviewer** (after `manage_worktree.py apply`): `python3 "<CORE_REVIEW_DIR>/scripts/collect_review_context.py" --repo "<REPO_ROOT>" --staged`
 
 ### Pass-Disciplined Review Strategy (Pass 1 Multi-Agent Gate -> Pass 2+ Direct Delta Check)
 
@@ -52,11 +53,12 @@ Collect the diff context via `<CORE_REVIEW_DIR>/scripts/collect_review_context.p
      - Never execute Lead-only session/title initialization.
      - Namespace every helper uniquely (`<prefix>-p1-cor`, `<prefix>-p1-adv`, conditional `<prefix>-p1-saf`, optional large-diff `<prefix>-p1-ver` within the harness adapter's name-length cap) with `<CALLER> = <SELF>` so helpers never wake `<LEAD>`.
      - Verify specialist claims directly in the source files per `<CORE_REVIEW_DIR>/playbooks/verifier.md` ([verifier.md](../../review/playbooks/verifier.md)), strip out-of-scope untouched code and disproportionate nitpicks, terminate **every** helper via `KILL_WORKER`, and remove `<SUMMARY_DIR>`.
+   - **Check for Second-Order Failures**: Never stop inspecting a modified code path after spotting the first plausible defect—keep tracing downstream callers, error-rollback paths, partial state mutations, and sibling invariants for secondary failures exposed by the same change.
    - Verify **zero swarm/plan/review meta-comments** leaked into code or docs, and run build/lint/test suites **once** yourself to confirm they pass.
    - **Immediate Pass 1 Sign-Off**: If zero in-scope `[MUST-FIX]` defects exist, issue `[APPROVED]` immediately—never force an extra round over minor `[OPTIONAL]` polish!
 
 2. **Pass 2+ — Direct Delta Verification (No Full Ensemble Re-Spawn)**:
-   - When `<PAIRED_CODER>` (or the seam fix `Coder`) replies `[fixed]`, inspect the modified files/lines **directly yourself** to verify every Pass 1 `[MUST-FIX]` item is resolved cleanly without regressions or leaked meta-comments, and re-run build/lint/tests.
+   - When `<PAIRED_CODER>` (or the seam fix `Coder`) replies `[fixed]`, re-verify `git diff --stat` / `git status --short` against the claimed fixes (still excluding any Step 0 pre-existing unrelated dirty paths listed for an in-place run and confirming they remained untouched), inspect the modified files/lines **directly yourself** (checking for second-order regressions as well as the original defects) to confirm every Pass 1 `[MUST-FIX]` item is resolved cleanly without leaked meta-comments, and re-run build/lint/tests.
    - **Do NOT re-spawn the specialist ensemble on Pass 2+**—spawn at most **1** targeted `<prefix>-p<N>-saf` or `<prefix>-p<N>-adv` helper *only* if the fix rewrote `> 150` lines or added brand-new `unsafe`/C++/FFI/crypto code (and `KILL_WORKER` it immediately after).
    - **No Goalpost-Moving**: Pass 2+ may block **only** on unaddressed/broken Pass 1 `[MUST-FIX]` items or genuine `CRITICAL`/`HIGH` regressions introduced by the fix—never raise new `MEDIUM`/`LOW`/`STYLE` demands on unchanged Pass 1 code.
 

@@ -14,13 +14,15 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+norecursedirs = ["shared", ".*", "*.egg", "build", "dist", "node_modules", "venv"]
 pythonpath = ["."]
 addopts = ["-ra", "--strict-markers"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 100
+extend-exclude = ["shared/*/scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
-ignore = ["UP007", "UP038"]
+ignore = ["UP007"]

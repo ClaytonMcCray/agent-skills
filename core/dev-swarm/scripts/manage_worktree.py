@@ -1433,7 +1433,7 @@ def _cmd_cleanup(
         _validate_dir_ancestors(wt_abs.parent, "worktree path")
         resolved_missing = _resolve_possibly_missing(wt_abs)
         if resolved_missing is None or _path_exists_or_symlink(resolved_missing):
-            raise _WorktreeError(f"refusing to clean unmanaged missing path: {disp}")
+            raise _WorktreeError(f"refusing to clean unmanaged missing path: {disp}") from None
         target_res = resolved_missing
     except (OSError, ValueError) as exc:
         raise _WorktreeError(f"failed to inspect worktree path {disp!r}: {exc}") from exc

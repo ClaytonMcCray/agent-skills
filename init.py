@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import unquote
 
 
@@ -33,6 +34,18 @@ class HarnessSpec:
     config_rel_dir: str
     skills_json_name: str
     skills_dir_name: str
+    plugins_dir_name: str = "plugins"
+    config_json_name: str = "config.json"
+    global_agents_name: str = "AGENTS.md"
+
+
+class ShadowingPlugin(NamedTuple):
+    """A non-marketplace local plugin shadowing one or more repository skills."""
+
+    plugin_path: Path
+    colliding_skills: list[str]
+    extra_unmigrated_skills: list[str]
+    extra_runtime_components: tuple[str, ...] = ()
 
 
 HARNESS_REGISTRY: dict[str, HarnessSpec] = {
@@ -42,6 +55,9 @@ HARNESS_REGISTRY: dict[str, HarnessSpec] = {
         config_rel_dir=".gemini/config",
         skills_json_name="skills.json",
         skills_dir_name="skills",
+        plugins_dir_name="plugins",
+        config_json_name="config.json",
+        global_agents_name="AGENTS.md",
     ),
 }
 
@@ -77,6 +93,16 @@ PATH_SCAN_SUFFIXES = frozenset({".md", ".py", ".json"})
 COMMONMARK_ASCII_PUNCT = frozenset(r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~""")
 YAML_TOKEN_BOUNDARIES = frozenset({" ", "\t", "[", "{", ",", ":"})
 MAX_FLOW_DEPTH = 32
+GLOBAL_AGENTS_MAX_BYTES = 24_000
+PLUGIN_RUNTIME_COMPONENT_NAMES = frozenset(
+    {
+        "mcp_config.json",
+        "hooks.json",
+        "hooks",
+        "sidecars",
+        "sidecars.json",
+    }
+)
 
 _UMASK_LOCK = threading.Lock()
 
@@ -174,6 +200,20 @@ def _agy_config_paths(home: Path) -> tuple[Path, Path, Path]:
         config_dir / spec.skills_json_name,
         config_dir / spec.skills_dir_name,
     )
+
+
+def _agy_global_agents_path(home: Path) -> Path:
+    spec = HARNESS_REGISTRY["agy"]
+    return home / spec.config_rel_dir / spec.global_agents_name
+
+
+def _agy_plugins_dir(home: Path) -> Path:
+    spec = HARNESS_REGISTRY["agy"]
+    return home / spec.config_rel_dir / spec.plugins_dir_name
+
+
+def _agy_config_json_path(config_dir: Path) -> Path:
+    return config_dir / HARNESS_REGISTRY["agy"].config_json_name
 
 
 def _validate_dir_ancestors(target_dir: Path, *, stop_at: Path | None = None) -> str | None:
@@ -357,18 +397,12 @@ def _duplicate_agy_skill_names(repo_root: Path) -> set[str]:
     return shared_names & agy_names
 
 
-def format_skills_json_path(target: Path, home: Path) -> str:
-    """Format a target path as ~/... when under home, else as an absolute POSIX path."""
-    home_res = safe_resolve(home)
+def format_skills_json_path(target: Path, home: Path | None = None) -> str:
+    """Format a target path as an absolute POSIX path (never ~/...) for skills.json."""
+    _ = home
     target_res = safe_resolve(target)
-    if home_res is None:
-        home_res = Path(os.path.abspath(str(home)))
     if target_res is None:
         target_res = Path(os.path.abspath(str(target)))
-    if target_res == home_res:
-        return "~"
-    if target_res.is_relative_to(home_res):
-        return f"~/{target_res.relative_to(home_res).as_posix()}"
     return target_res.as_posix()
 
 
@@ -1372,24 +1406,205 @@ def _desired_agy_targets(repo_root: Path) -> list[Path]:
     return [repo_root / "shared", repo_root / HARNESS_REGISTRY["agy"].repo_rel_dir]
 
 
-def _configured_resolved_paths(data: dict[str, object], home: Path) -> set[Path]:
+def _desired_canonical_targets(repo_root: Path) -> set[str]:
+    targets: set[str] = set()
+    for desired in _desired_agy_targets(repo_root):
+        resolved = safe_resolve(desired)
+        if resolved is not None:
+            targets.add(resolved.as_posix())
+    return targets
+
+
+def _is_tilde_path(raw_path: str) -> bool:
+    return raw_path == "~" or raw_path.startswith("~/")
+
+
+def _resolve_entry_path(
+    raw_path: str, home: Path, *, virtual_agents_target: Path | None = None
+) -> Path | None:
+    """Resolve a skills.json entry path, optionally projecting ~/.agents/skills -> shared."""
+    if virtual_agents_target is not None and "\x00" not in raw_path:
+        candidate: Path | None = None
+        if raw_path == "~":
+            candidate = home
+        elif raw_path.startswith("~/"):
+            rel = raw_path[2:].lstrip("/")
+            candidate = (home / rel) if rel else home
+        elif raw_path.startswith("/"):
+            candidate = Path(raw_path)
+
+        if candidate is not None:
+            home_res = safe_resolve(home) or Path(os.path.abspath(str(home)))
+            agents_dir_res = safe_resolve(home / ".agents") or (home_res / ".agents")
+            virtual_link = Path(os.path.normpath(str(agents_dir_res / "skills")))
+            parent_res = safe_resolve(candidate.parent)
+            norm_candidate = (
+                (parent_res / candidate.name)
+                if (parent_res is not None and candidate.name)
+                else Path(os.path.normpath(str(candidate)))
+            )
+            if norm_candidate == virtual_link:
+                return virtual_agents_target
+            if norm_candidate.is_relative_to(virtual_link):
+                return safe_resolve(
+                    virtual_agents_target / norm_candidate.relative_to(virtual_link)
+                )
+
+    return resolve_configured_entry_path(raw_path, home)
+
+
+def _normalize_tilde_entry_path(
+    raw_path: str, home: Path, *, virtual_agents_target: Path | None = None
+) -> str:
+    """Resolve a '~' or '~/...' skills.json entry path to an absolute POSIX path."""
+    resolved = _resolve_entry_path(raw_path, home, virtual_agents_target=virtual_agents_target)
+    if resolved is not None:
+        return resolved.as_posix()
+    home_res = safe_resolve(home) or Path(os.path.abspath(str(home)))
+    if raw_path == "~":
+        return home_res.as_posix()
+    rel = raw_path[2:].lstrip("/")
+    target = (home_res / rel) if rel else home_res
+    return Path(os.path.abspath(str(target))).as_posix()
+
+
+class _SkillsJsonNormalization(NamedTuple):
+    entries: list[object]
+    changed: bool
+    has_tilde: bool
+    has_duplicates: bool
+    has_non_canonical_repo: bool
+
+
+def _plan_skills_json_normalization(
+    data: dict[str, object],
+    home: Path,
+    *,
+    canonical_targets: set[str] | frozenset[str] = frozenset(),
+    virtual_agents_target: Path | None = None,
+) -> _SkillsJsonNormalization:
+    """Compute normalized/deduplicated skills.json entries without mutating data."""
+    entries = data.get("entries")
+    if not isinstance(entries, list):
+        return _SkillsJsonNormalization([], False, False, False, False)
+
+    changed = False
+    has_tilde = False
+    has_duplicates = False
+    has_non_canonical_repo = False
+    normalized: list[object] = []
+    seen_idx: dict[tuple[str, str], int] = {}
+
+    for item in entries:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            normalized.append(item)
+            continue
+
+        raw_path = item["path"]
+        is_tilde = _is_tilde_path(raw_path)
+        resolved = _resolve_entry_path(
+            raw_path, home, virtual_agents_target=virtual_agents_target
+        )
+        if is_tilde:
+            has_tilde = True
+            new_path = _normalize_tilde_entry_path(
+                raw_path, home, virtual_agents_target=virtual_agents_target
+            )
+        elif (
+            resolved is not None
+            and resolved.as_posix() in canonical_targets
+            and raw_path != resolved.as_posix()
+        ):
+            has_non_canonical_repo = True
+            new_path = resolved.as_posix()
+        else:
+            new_path = raw_path
+
+        canon_path = resolved.as_posix() if resolved is not None else new_path
+        other_fields = json.dumps(
+            {k: v for k, v in item.items() if k != "path"},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        key = (canon_path, other_fields)
+
+        if key in seen_idx:
+            has_duplicates = True
+            changed = True
+            prev_pos = seen_idx[key]
+            prev_entry = normalized[prev_pos]
+            if (
+                isinstance(prev_entry, dict)
+                and prev_entry.get("path") != canon_path
+                and new_path == canon_path
+            ):
+                upgraded = dict(prev_entry)
+                upgraded["path"] = canon_path
+                normalized[prev_pos] = upgraded
+            continue
+
+        if new_path != raw_path:
+            new_item: dict[str, object] = dict(item)
+            new_item["path"] = new_path
+            changed = True
+        else:
+            new_item = item
+
+        seen_idx[key] = len(normalized)
+        normalized.append(new_item)
+
+    return _SkillsJsonNormalization(
+        normalized, changed, has_tilde, has_duplicates, has_non_canonical_repo
+    )
+
+
+def _normalize_and_dedupe_skills_json_entries(
+    data: dict[str, object],
+    home: Path,
+    *,
+    canonical_targets: set[str] | frozenset[str] = frozenset(),
+    virtual_agents_target: Path | None = None,
+) -> bool:
+    """Normalize tilde/alias paths and deduplicate identical entries in place."""
+    plan = _plan_skills_json_normalization(
+        data,
+        home,
+        canonical_targets=canonical_targets,
+        virtual_agents_target=virtual_agents_target,
+    )
+    if plan.changed:
+        data["entries"] = plan.entries
+    return plan.changed
+
+
+def _configured_resolved_paths(
+    data: dict[str, object], home: Path, *, virtual_agents_target: Path | None = None
+) -> set[Path]:
     resolved_paths: set[Path] = set()
     entries = data.get("entries")
     if not isinstance(entries, list):
         return resolved_paths
     for item in entries:
         if isinstance(item, dict) and isinstance(item.get("path"), str):
-            resolved = resolve_configured_entry_path(item["path"], home)
+            resolved = _resolve_entry_path(
+                item["path"], home, virtual_agents_target=virtual_agents_target
+            )
             if resolved is not None:
                 resolved_paths.add(resolved)
     return resolved_paths
 
 
 def _missing_skills_json_entries(
-    data: dict[str, object], repo_root: Path, home: Path
+    data: dict[str, object],
+    repo_root: Path,
+    home: Path,
+    *,
+    virtual_agents_target: Path | None = None,
 ) -> tuple[list[tuple[Path, str]], list[str]]:
     """Return (missing_targets_with_formatted_path, target_errors) for Antigravity."""
-    configured = _configured_resolved_paths(data, home)
+    configured = _configured_resolved_paths(
+        data, home, virtual_agents_target=virtual_agents_target
+    )
     missing: list[tuple[Path, str]] = []
     target_errors: list[str] = []
     repo_root_res = safe_resolve(repo_root, strict=True)
@@ -1607,6 +1822,350 @@ def _find_shadowing_agy_skills(
     return (colliding, None)
 
 
+def _load_marketplace_plugin_names(config_dir: Path) -> tuple[set[str], str | None]:
+    """Return (marketplace_plugin_names, error) from config.json, failing closed on corruption."""
+    config_json_path = _agy_config_json_path(config_dir)
+    try:
+        st = os.lstat(config_json_path)
+    except FileNotFoundError:
+        return (set(), None)
+    except OSError as exc:
+        return (set(), f"{config_json_path}: inaccessible ({exc})")
+
+    if stat.S_ISLNK(st.st_mode):
+        resolved = safe_resolve(config_json_path, strict=True)
+        if resolved is None:
+            return (set(), f"{config_json_path}: broken or circular symlink")
+        if not _safe_is_file(resolved):
+            return (set(), f"{config_json_path}: symlink points to non-file ({resolved})")
+        read_path = resolved
+    elif not stat.S_ISREG(st.st_mode):
+        return (set(), f"{config_json_path}: exists and is not a regular file")
+    else:
+        read_path = config_json_path
+
+    try:
+        raw_text = read_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return (set(), f"{config_json_path}: failed to read UTF-8 JSON: {exc}")
+
+    try:
+        data = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        return (
+            set(),
+            f"{config_json_path}: invalid JSON ({exc.msg} at line {exc.lineno}, col {exc.colno})",
+        )
+
+    if not isinstance(data, dict):
+        return (set(), f"{config_json_path}: top-level JSON value must be an object")
+
+    plugins = data.get("plugins")
+    if plugins is None:
+        return (set(), None)
+    if not isinstance(plugins, dict):
+        return (set(), f"{config_json_path}: 'plugins' must be a JSON object")
+
+    marketplace: set[str] = set()
+    for name, meta in plugins.items():
+        if not isinstance(name, str) or not isinstance(meta, dict):
+            return (set(), f"{config_json_path}: 'plugins[{name!r}]' must be a JSON object")
+        if bool(meta.get("installedFrom")):
+            marketplace.add(name)
+    return (marketplace, None)
+
+
+def _find_shadowing_agy_plugins(
+    home: Path, repo_skill_map: dict[str, Path]
+) -> tuple[list[ShadowingPlugin], str | None]:
+    """Find non-marketplace local plugins in ~/.gemini/config/plugins/ shadowing repo skills."""
+    config_dir, _, _ = _agy_config_paths(home)
+    plugins_dir = _agy_plugins_dir(home)
+    try:
+        dir_st = os.lstat(plugins_dir)
+    except FileNotFoundError:
+        return ([], None)
+    except OSError as exc:
+        return ([], f"{plugins_dir}: inaccessible ({exc})")
+    if stat.S_ISLNK(dir_st.st_mode) or not stat.S_ISDIR(dir_st.st_mode):
+        return ([], None)
+
+    marketplace_names, cfg_err = _load_marketplace_plugin_names(config_dir)
+    if cfg_err is not None:
+        return ([], cfg_err)
+    plugin_entries, err = _iter_visible_entries_checked(plugins_dir)
+    if err is not None:
+        return ([], err)
+
+    results: list[ShadowingPlugin] = []
+    for plugin_entry in plugin_entries:
+        if plugin_entry.name in marketplace_names:
+            continue
+        try:
+            p_st = os.lstat(plugin_entry)
+        except OSError as exc:
+            return ([], f"{plugin_entry}: inaccessible ({exc})")
+        if stat.S_ISLNK(p_st.st_mode):
+            if not _safe_is_dir(plugin_entry):
+                continue
+        elif not stat.S_ISDIR(p_st.st_mode):
+            continue
+
+        plugin_skills_dir = plugin_entry / "skills"
+        try:
+            os.lstat(plugin_skills_dir)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return ([], f"{plugin_skills_dir}: inaccessible ({exc})")
+        if not _safe_is_dir(plugin_skills_dir):
+            continue
+
+        skill_entries, s_err = _iter_visible_entries_checked(plugin_skills_dir)
+        if s_err is not None:
+            return ([], s_err)
+
+        colliding_skills: list[str] = []
+        extra_unmigrated_skills: list[str] = []
+        for skill_entry in skill_entries:
+            try:
+                s_st = os.lstat(skill_entry)
+            except OSError as exc:
+                return ([], f"{skill_entry}: inaccessible ({exc})")
+            if not (stat.S_ISDIR(s_st.st_mode) or stat.S_ISLNK(s_st.st_mode)):
+                continue
+            if skill_entry.name in repo_skill_map:
+                colliding_skills.append(skill_entry.name)
+            else:
+                extra_unmigrated_skills.append(skill_entry.name)
+
+        if colliding_skills:
+            plugin_children, child_err = _iter_visible_entries_checked(plugin_entry)
+            if child_err is not None:
+                return ([], child_err)
+            extra_runtime_components = tuple(
+                child.name
+                for child in plugin_children
+                if child.name in PLUGIN_RUNTIME_COMPONENT_NAMES
+            )
+            results.append(
+                ShadowingPlugin(
+                    plugin_entry,
+                    colliding_skills,
+                    extra_unmigrated_skills,
+                    extra_runtime_components,
+                )
+            )
+
+    return (results, None)
+
+
+def _collect_skill_tree_entries(root: Path) -> dict[str, tuple[str, Path]] | None:
+    """Collect non-pruned relative entries (kind, path) beneath root without following symlinks."""
+    entries: dict[str, tuple[str, Path]] = {}
+    had_error = False
+
+    def on_walk_error(_exc: OSError) -> None:
+        nonlocal had_error
+        had_error = True
+
+    for dirpath_str, dirnames, filenames in os.walk(
+        root, followlinks=False, onerror=on_walk_error
+    ):
+        dirpath = Path(dirpath_str)
+        kept: list[str] = []
+        for dirname in dirnames:
+            if _is_pruned_name(dirname) or dirname.startswith(".adopt-"):
+                continue
+            full_dir = dirpath / dirname
+            rel = full_dir.relative_to(root).as_posix()
+            try:
+                st = os.lstat(full_dir)
+            except OSError:
+                return None
+            if stat.S_ISLNK(st.st_mode):
+                entries[rel] = ("symlink", full_dir)
+            else:
+                entries[rel] = ("dir", full_dir)
+                kept.append(dirname)
+        dirnames[:] = kept
+
+        for filename in filenames:
+            if _is_pruned_name(filename) or filename.startswith(".adopt-"):
+                continue
+            full_file = dirpath / filename
+            rel = full_file.relative_to(root).as_posix()
+            try:
+                st = os.lstat(full_file)
+            except OSError:
+                return None
+            if stat.S_ISLNK(st.st_mode):
+                entries[rel] = ("symlink", full_file)
+            elif stat.S_ISREG(st.st_mode):
+                entries[rel] = ("file", full_file)
+            else:
+                entries[rel] = ("other", full_file)
+
+    return None if had_error else entries
+
+
+def _files_differ(path_a: Path, path_b: Path) -> bool:
+    """Return True if two regular files differ in user exec bit, size, or content bytes."""
+    try:
+        st_a = os.lstat(path_a)
+        st_b = os.lstat(path_b)
+        if bool(st_a.st_mode & stat.S_IXUSR) != bool(st_b.st_mode & stat.S_IXUSR):
+            return True
+        if st_a.st_size != st_b.st_size:
+            return True
+        with path_a.open("rb") as fa, path_b.open("rb") as fb:
+            while True:
+                chunk_a = fa.read(65536)
+                chunk_b = fb.read(65536)
+                if chunk_a != chunk_b:
+                    return True
+                if not chunk_a:
+                    return False
+    except OSError:
+        return True
+
+
+def _skill_trees_differ(dir_a: Path, dir_b: Path) -> bool:
+    """Return True if two skill directory trees differ in non-pruned files or symlinks."""
+    res_a = safe_resolve(dir_a, strict=True)
+    res_b = safe_resolve(dir_b, strict=True)
+    if res_a is None or res_b is None:
+        return True
+    if not _safe_is_dir(res_a) or not _safe_is_dir(res_b):
+        return True
+    if res_a == res_b:
+        return False
+
+    entries_a = _collect_skill_tree_entries(res_a)
+    entries_b = _collect_skill_tree_entries(res_b)
+    if entries_a is None or entries_b is None:
+        return True
+    if entries_a.keys() != entries_b.keys():
+        return True
+
+    for rel, (kind_a, path_a) in entries_a.items():
+        kind_b, path_b = entries_b[rel]
+        if kind_a != kind_b:
+            return True
+        if kind_a == "symlink":
+            try:
+                if os.readlink(path_a) != os.readlink(path_b):
+                    return True
+            except OSError:
+                return True
+        elif kind_a == "file":
+            if _files_differ(path_a, path_b):
+                return True
+        elif kind_a == "other":
+            return True
+    return False
+
+
+def _scan_agents_skills_dir(
+    agents_skills: Path, shared_dir: Path
+) -> tuple[list[str], list[str], list[str]]:
+    """Compare a real ~/.agents/skills directory against repo shared/.
+
+    Returns (unmigrated_names, differing_names, warnings).
+    """
+    existing_entries, list_err = _iter_visible_entries_checked(agents_skills)
+    if list_err is not None:
+        return ([], [], [list_err])
+
+    shared_map = {p.name: p for p in discover_skill_dirs(shared_dir)}
+    unmigrated: list[str] = []
+    differing: list[str] = []
+    warnings: list[str] = []
+    for entry in existing_entries:
+        try:
+            entry_st = os.lstat(entry)
+        except OSError as exc:
+            warnings.append(f"could not inspect {entry}: {exc}")
+            continue
+        if not (stat.S_ISDIR(entry_st.st_mode) or stat.S_ISLNK(entry_st.st_mode)):
+            continue
+        if entry.name not in shared_map:
+            unmigrated.append(entry.name)
+        elif _skill_trees_differ(entry, shared_map[entry.name]):
+            differing.append(entry.name)
+    return (sorted(unmigrated), sorted(differing), warnings)
+
+
+def _inspect_shadow_container_status(label: str, container_dir: Path) -> bool:
+    """Print status for non-scannable shadow containers; return True when ready to scan."""
+    try:
+        st = os.lstat(container_dir)
+    except FileNotFoundError:
+        print(f"{label} ({container_dir}): no shadowing collisions")
+        return False
+    except OSError as exc:
+        print(f"{label} ({container_dir}): invalid (inaccessible: {exc})")
+        return False
+
+    if stat.S_ISLNK(st.st_mode):
+        raw_link = _safe_readlink(container_dir)
+        resolved = safe_resolve(container_dir, strict=True)
+        if resolved is None:
+            print(f"{label} ({container_dir}): conflict (broken or circular symlink -> {raw_link})")
+        else:
+            print(f"{label} ({container_dir}): symlink -> {resolved} (not traversed for shadowing)")
+        return False
+    if not stat.S_ISDIR(st.st_mode):
+        print(f"{label} ({container_dir}): conflict (non-directory file)")
+        return False
+    return True
+
+
+def _preflight_shadow_container_apply(
+    container_dir: Path, scan_label: str, *, replace: bool
+) -> tuple[bool, bool]:
+    """Validate a shadow container before apply; return (should_scan, status_ok)."""
+    try:
+        st = os.lstat(container_dir)
+    except FileNotFoundError:
+        return (False, True)
+    except OSError as exc:
+        print(f"ERROR: cannot inspect {container_dir}: {exc}", file=sys.stderr)
+        return (False, False)
+
+    if stat.S_ISLNK(st.st_mode):
+        raw_link = _safe_readlink(container_dir)
+        if not replace:
+            print(
+                f"WARNING: {container_dir} is a symlink (-> {raw_link}); "
+                f"skipping {scan_label} collision scan.",
+                file=sys.stderr,
+            )
+            return (False, True)
+        print(
+            f"ERROR: {container_dir} is a symlink (-> {raw_link}); "
+            "refusing to move entries through symlinked directory.",
+            file=sys.stderr,
+        )
+        return (False, False)
+
+    if not stat.S_ISDIR(st.st_mode):
+        if not replace:
+            print(
+                f"WARNING: {container_dir} exists as a non-directory file; "
+                f"skipping {scan_label} collision scan.",
+                file=sys.stderr,
+            )
+            return (False, True)
+        print(
+            f"ERROR: {container_dir} exists as a non-directory file; cannot inspect shadows.",
+            file=sys.stderr,
+        )
+        return (False, False)
+
+    return (True, True)
+
+
 def cmd_status(repo_root: Path, home: Path) -> int:
     """Print a read-only report of repo skills, ~/.agents/skills, and Antigravity config."""
     if not _safe_is_dir(repo_root):
@@ -1654,8 +2213,20 @@ def cmd_status(repo_root: Path, home: Path) -> int:
                         f"conflict (symlink -> {resolved_link}, expected {expected_shared})"
                     )
             elif stat.S_ISDIR(agents_st.st_mode):
+                unmigrated, differing, scan_warnings = _scan_agents_skills_dir(
+                    agents_skills, shared_dir
+                )
+                details: list[str] = []
+                if unmigrated:
+                    details.append(f"unmigrated: {', '.join(unmigrated)}")
+                if differing:
+                    details.append(f"differs from repo shared/: {', '.join(differing)}")
+                if scan_warnings:
+                    details.append(f"scan warnings: {'; '.join(scan_warnings)}")
+                detail_note = f"; {'; '.join(details)}" if details else ""
                 agents_status = (
-                    "conflict (real directory; run 'init.py apply --replace' to back up)"
+                    f"conflict (real directory{detail_note}; "
+                    "run 'init.py apply --replace' to back up)"
                 )
             else:
                 agents_status = (
@@ -1664,11 +2235,15 @@ def cmd_status(repo_root: Path, home: Path) -> int:
     print(f"\n~/.agents/skills ({agents_skills}): {agents_status}")
 
     config_dir, skills_json_path, agy_skills_dir = _agy_config_paths(home)
+    agents_md_path = _agy_global_agents_path(home)
+    plugins_dir = _agy_plugins_dir(home)
     repo_agy_skills = discover_agy_repo_skills(repo_root)
     config_ancestor_err = _validate_dir_ancestors(config_dir, stop_at=home)
     if config_ancestor_err is not None:
         print(f"~/.gemini/config/skills.json ({skills_json_path}): invalid ({config_ancestor_err})")
+        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): invalid ({config_ancestor_err})")
         print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid ({config_ancestor_err})")
+        print(f"~/.gemini/config/plugins ({plugins_dir}): invalid ({config_ancestor_err})")
         return 0
 
     try:
@@ -1693,64 +2268,179 @@ def cmd_status(repo_root: Path, home: Path) -> int:
                 )
             else:
                 missing, target_errors = _missing_skills_json_entries(data, repo_root, home)
+                norm_plan = _plan_skills_json_normalization(
+                    data, home, canonical_targets=_desired_canonical_targets(repo_root)
+                )
                 hidden = _hidden_repo_skills(data, repo_agy_skills, home)
                 if target_errors:
-                    print(
-                        f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: "
-                        f"invalid repo target ({'; '.join(target_errors)})"
-                    )
-                elif missing:
-                    missing_labels = ", ".join(formatted for _, formatted in missing)
-                    print(
-                        f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: "
-                        f"missing entries ({missing_labels})"
-                    )
-                elif hidden:
-                    print(
-                        f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: "
-                        f"configured (filtered out by include_only/exclude: {', '.join(hidden)})"
-                    )
+                    status_detail = f"invalid repo target ({'; '.join(target_errors)})"
                 else:
-                    print(
-                        f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: configured"
-                    )
+                    issues: list[str] = []
+                    if missing:
+                        missing_labels = ", ".join(formatted for _, formatted in missing)
+                        issues.append(f"missing entries ({missing_labels})")
+                    if norm_plan.has_tilde:
+                        issues.append(
+                            "needs path normalization "
+                            "(non-absolute '~/...' entries rejected by Antigravity)"
+                        )
+                    if norm_plan.has_non_canonical_repo:
+                        issues.append(
+                            "needs path normalization (non-canonical repo alias entries)"
+                        )
+                    if norm_plan.has_duplicates:
+                        issues.append("needs deduplication (duplicate entries)")
+                    if issues:
+                        status_detail = "; ".join(issues)
+                        if hidden:
+                            status_detail += (
+                                f"; filtered out by include_only/exclude: {', '.join(hidden)}"
+                            )
+                    elif hidden:
+                        status_detail = (
+                            f"configured (filtered out by include_only/exclude: "
+                            f"{', '.join(hidden)})"
+                        )
+                    else:
+                        status_detail = "configured"
+                print(
+                    f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: {status_detail}"
+                )
 
+    expected_global_agents = safe_resolve(repo_root / "global" / "AGENTS.md")
     try:
-        agy_st = os.lstat(agy_skills_dir)
+        agents_md_st = os.lstat(agents_md_path)
     except FileNotFoundError:
-        print(f"~/.gemini/config/skills ({agy_skills_dir}): no shadowing collisions")
+        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): not installed")
     except OSError as exc:
-        print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid (inaccessible: {exc})")
+        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): invalid (inaccessible: {exc})")
     else:
-        if stat.S_ISLNK(agy_st.st_mode):
-            raw_link = _safe_readlink(agy_skills_dir)
-            resolved_skills = safe_resolve(agy_skills_dir, strict=True)
-            if resolved_skills is None:
-                print(
-                    f"~/.gemini/config/skills ({agy_skills_dir}): "
-                    f"conflict (broken or circular symlink -> {raw_link})"
-                )
+        if stat.S_ISLNK(agents_md_st.st_mode):
+            resolved_md = safe_resolve(agents_md_path, strict=True)
+            raw_md_link = _safe_readlink(agents_md_path)
+            if resolved_md is None:
+                md_status = f"conflict (broken or circular symlink -> {raw_md_link})"
+            elif expected_global_agents is not None and resolved_md == expected_global_agents:
+                md_status = f"ok (symlink -> {resolved_md})"
             else:
-                print(
-                    f"~/.gemini/config/skills ({agy_skills_dir}): "
-                    f"symlink -> {resolved_skills} (not traversed for shadowing)"
+                md_status = (
+                    f"conflict (symlink -> {resolved_md}, expected {expected_global_agents})"
                 )
-        elif not stat.S_ISDIR(agy_st.st_mode):
-            print(f"~/.gemini/config/skills ({agy_skills_dir}): conflict (non-directory file)")
+        elif stat.S_ISREG(agents_md_st.st_mode):
+            md_status = (
+                "conflict (regular file; run 'init.py apply --replace' to back up, "
+                "or pass '--no-global-agents' to keep)"
+            )
+        elif stat.S_ISDIR(agents_md_st.st_mode):
+            md_status = (
+                "conflict (directory; run 'init.py apply --replace' to back up, "
+                "or pass '--no-global-agents' to keep)"
+            )
         else:
-            shadowing, scan_err = _find_shadowing_agy_skills(home, repo_agy_skills)
-            if scan_err is not None:
-                print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid ({scan_err})")
-            elif shadowing:
-                names = ", ".join(entry.name for entry in shadowing)
-                print(
-                    f"~/.gemini/config/skills ({agy_skills_dir}): "
-                    f"shadowing repo skills ({names})"
-                )
-            else:
-                print(f"~/.gemini/config/skills ({agy_skills_dir}): no shadowing collisions")
+            md_status = (
+                "conflict (non-regular file; run 'init.py apply --replace' to back up, "
+                "or pass '--no-global-agents' to keep)"
+            )
+        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): {md_status}")
+
+    if _inspect_shadow_container_status("~/.gemini/config/skills", agy_skills_dir):
+        shadowing, scan_err = _find_shadowing_agy_skills(home, repo_agy_skills)
+        if scan_err is not None:
+            print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid ({scan_err})")
+        elif shadowing:
+            names = ", ".join(entry.name for entry in shadowing)
+            print(f"~/.gemini/config/skills ({agy_skills_dir}): shadowing repo skills ({names})")
+        else:
+            print(f"~/.gemini/config/skills ({agy_skills_dir}): no shadowing collisions")
+
+    if _inspect_shadow_container_status("~/.gemini/config/plugins", plugins_dir):
+        shadowing_plugins, plugin_err = _find_shadowing_agy_plugins(home, repo_agy_skills)
+        if plugin_err is not None:
+            print(f"~/.gemini/config/plugins ({plugins_dir}): invalid ({plugin_err})")
+        elif shadowing_plugins:
+            parts: list[str] = []
+            for sp in shadowing_plugins:
+                label = f"{sp.plugin_path.name}: {', '.join(sp.colliding_skills)}"
+                blockers: list[str] = []
+                if sp.extra_unmigrated_skills:
+                    blockers.append(f"unmigrated: {', '.join(sp.extra_unmigrated_skills)}")
+                if sp.extra_runtime_components:
+                    blockers.append(
+                        f"non-skill components: {', '.join(sp.extra_runtime_components)}"
+                    )
+                if blockers:
+                    label += f" ({'; '.join(blockers)})"
+                parts.append(label)
+            print(
+                f"~/.gemini/config/plugins ({plugins_dir}): "
+                f"shadowing repo skills ({'; '.join(parts)})"
+            )
+        else:
+            print(f"~/.gemini/config/plugins ({plugins_dir}): no shadowing collisions")
 
     return 0
+
+
+def _backup_and_symlink(
+    link_path: Path,
+    target_res: Path,
+    backup_dir: Path,
+    backup_stem: str,
+    timestamp: str,
+    *,
+    is_real_dir: bool,
+) -> bool:
+    """Atomically back up link_path into backup_dir and replace it with a symlink to target_res."""
+    try:
+        backup_path = (
+            _create_unique_backup_dir(backup_dir, backup_stem, timestamp)
+            if is_real_dir
+            else _create_unique_backup_file_slot(backup_dir, backup_stem, timestamp)
+        )
+    except OSError as exc:
+        print(f"ERROR: failed to reserve backup slot in {backup_dir}: {exc}", file=sys.stderr)
+        return False
+
+    try:
+        os.rename(link_path, backup_path)
+    except OSError as exc:
+        if is_real_dir:
+            with contextlib.suppress(OSError):
+                backup_path.rmdir()
+        else:
+            with contextlib.suppress(OSError):
+                backup_path.unlink()
+        print(f"ERROR: failed to back up {link_path} -> {backup_path}: {exc}", file=sys.stderr)
+        return False
+
+    try:
+        link_path.symlink_to(target_res)
+    except BaseException as exc:
+        if not _path_exists_or_symlink(link_path):
+            try:
+                os.rename(backup_path, link_path)
+            except OSError as rb_exc:
+                print(
+                    f"ERROR: rollback failed ({backup_path} -> {link_path}): {rb_exc}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"ERROR: rollback skipped because {link_path} reappeared; "
+                f"original backup preserved at {backup_path}",
+                file=sys.stderr,
+            )
+        if isinstance(exc, OSError):
+            print(
+                f"ERROR: failed to symlink {link_path} -> {target_res}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        raise
+
+    print(f"Backed up {link_path} -> {backup_path}")
+    print(f"Linked {link_path} -> {target_res}")
+    return True
 
 
 def _apply_agents_symlink(
@@ -1839,35 +2529,28 @@ def _apply_agents_symlink(
             return False
 
     if is_real_dir:
-        existing_entries, list_err = _iter_visible_entries_checked(agents_skills)
-        if list_err is not None:
+        unmigrated, differing, scan_warnings = _scan_agents_skills_dir(agents_skills, shared_res)
+        for warning in scan_warnings:
             print(
-                f"WARNING: could not scan {agents_skills} for unmigrated skills ({list_err})",
+                f"WARNING: could not scan {agents_skills} for local skill differences ({warning})",
                 file=sys.stderr,
             )
-        else:
-            existing_names: set[str] = set()
-            for entry in existing_entries:
-                try:
-                    entry_st = os.lstat(entry)
-                except OSError as exc:
-                    print(
-                        f"WARNING: could not inspect {entry} during unmigrated scan: {exc}",
-                        file=sys.stderr,
-                    )
-                    continue
-                if stat.S_ISDIR(entry_st.st_mode) or stat.S_ISLNK(entry_st.st_mode):
-                    existing_names.add(entry.name)
-            shared_names = {p.name for p in discover_skill_dirs(shared_res)}
-            unmigrated = sorted(existing_names - shared_names)
-            if unmigrated:
-                preview_backup = unique_backup_path(agents_dir, "skills", timestamp)
-                print(
-                    f"WARNING: unmigrated skills in {agents_skills} not in repo shared/: "
-                    f"{', '.join(unmigrated)}. They will be preserved under {preview_backup}; "
-                    "import them with 'init.py adopt <backup>/<name> --scope shared'.",
-                    file=sys.stderr,
-                )
+        preview_backup = unique_backup_path(agents_dir, "skills", timestamp)
+        if unmigrated:
+            print(
+                f"WARNING: unmigrated skills in {agents_skills} not in repo shared/: "
+                f"{', '.join(unmigrated)}. They will be preserved under {preview_backup}; "
+                "import them with 'init.py adopt <backup>/<name> --scope shared'.",
+                file=sys.stderr,
+            )
+        if differing:
+            print(
+                f"WARNING: local skills in {agents_skills} differ from repo shared/: "
+                f"{', '.join(differing)}. They will be preserved under {preview_backup}; "
+                "inspect or import updates with "
+                "'init.py adopt <backup>/<name> --scope shared --force'.",
+                file=sys.stderr,
+            )
 
     if dry_run:
         preview_backup = unique_backup_path(agents_dir, "skills", timestamp)
@@ -1877,60 +2560,18 @@ def _apply_agents_symlink(
         )
         return True
 
-    try:
-        backup_path = (
-            _create_unique_backup_dir(agents_dir, "skills", timestamp)
-            if is_real_dir
-            else _create_unique_backup_file_slot(agents_dir, "skills", timestamp)
-        )
-    except OSError as exc:
-        print(f"ERROR: failed to reserve backup slot in {agents_dir}: {exc}", file=sys.stderr)
-        return False
-
-    try:
-        os.rename(agents_skills, backup_path)
-    except OSError as exc:
-        if is_real_dir:
-            with contextlib.suppress(OSError):
-                backup_path.rmdir()
-        else:
-            with contextlib.suppress(OSError):
-                backup_path.unlink()
-        print(f"ERROR: failed to back up {agents_skills} -> {backup_path}: {exc}", file=sys.stderr)
-        return False
-
-    try:
-        agents_skills.symlink_to(shared_res)
-    except BaseException as exc:
-        if not _path_exists_or_symlink(agents_skills):
-            try:
-                os.rename(backup_path, agents_skills)
-            except OSError as rb_exc:
-                print(
-                    f"ERROR: rollback failed ({backup_path} -> {agents_skills}): {rb_exc}",
-                    file=sys.stderr,
-                )
-        else:
-            print(
-                f"ERROR: rollback skipped because {agents_skills} reappeared; "
-                f"original backup preserved at {backup_path}",
-                file=sys.stderr,
-            )
-        if isinstance(exc, OSError):
-            print(
-                f"ERROR: failed to symlink {agents_skills} -> {shared_res}: {exc}",
-                file=sys.stderr,
-            )
-            return False
-        raise
-
-    print(f"Backed up {agents_skills} -> {backup_path}")
-    print(f"Linked {agents_skills} -> {shared_res}")
-    return True
+    return _backup_and_symlink(
+        agents_skills, shared_res, agents_dir, "skills", timestamp, is_real_dir=is_real_dir
+    )
 
 
 def _apply_agy_skills_json(
-    repo_root: Path, repo_root_res: Path, home: Path, *, dry_run: bool
+    repo_root: Path,
+    repo_root_res: Path,
+    home: Path,
+    *,
+    dry_run: bool,
+    virtual_agents_target: Path | None = None,
 ) -> tuple[bool, dict[str, object] | None]:
     """Non-destructively ensure repo entries exist in ~/.gemini/config/skills.json."""
     config_dir, skills_json_path, _ = _agy_config_paths(home)
@@ -1970,16 +2611,27 @@ def _apply_agy_skills_json(
             return (False, None)
         data = loaded
 
-    missing, target_errors = _missing_skills_json_entries(data, repo_root, home)
+    changed = False
+    if "entries" not in data:
+        data["entries"] = []
+        changed = True
+
+    if _normalize_and_dedupe_skills_json_entries(
+        data,
+        home,
+        canonical_targets=_desired_canonical_targets(repo_root),
+        virtual_agents_target=virtual_agents_target,
+    ):
+        changed = True
+
+    missing, target_errors = _missing_skills_json_entries(
+        data, repo_root, home, virtual_agents_target=virtual_agents_target
+    )
     if target_errors:
         for err in target_errors:
             print(f"ERROR: {err}", file=sys.stderr)
         return (False, None)
 
-    changed = False
-    if "entries" not in data:
-        data["entries"] = []
-        changed = True
     entries = data["entries"]
     assert isinstance(entries, list)
 
@@ -2009,6 +2661,170 @@ def _apply_agy_skills_json(
     return (True, data)
 
 
+def _apply_agy_global_agents(
+    repo_root: Path,
+    repo_root_res: Path,
+    home: Path,
+    timestamp: str,
+    *,
+    dry_run: bool,
+    replace: bool,
+    no_global_agents: bool,
+) -> bool:
+    """Link ~/.gemini/config/AGENTS.md -> <repo>/global/AGENTS.md unless opted out."""
+    agents_md_path = _agy_global_agents_path(home)
+    if no_global_agents:
+        print(f"Skipped {agents_md_path} (--no-global-agents)")
+        return True
+
+    global_container_err = _validate_in_repo_container(repo_root_res, ("global",))
+    if global_container_err is not None:
+        print(f"ERROR: {global_container_err}", file=sys.stderr)
+        return False
+
+    global_agents = repo_root / "global" / "AGENTS.md"
+    try:
+        global_st = os.lstat(global_agents)
+    except FileNotFoundError:
+        print(f"ERROR: repository global/AGENTS.md not found: {global_agents}", file=sys.stderr)
+        return False
+    except OSError as exc:
+        print(f"ERROR: cannot inspect {global_agents}: {exc}", file=sys.stderr)
+        return False
+    if stat.S_ISLNK(global_st.st_mode):
+        print(
+            f"ERROR: repository global/AGENTS.md must not be a symlink: {global_agents}",
+            file=sys.stderr,
+        )
+        return False
+    if not stat.S_ISREG(global_st.st_mode):
+        print(
+            f"ERROR: repository global/AGENTS.md must be a regular file: {global_agents}",
+            file=sys.stderr,
+        )
+        return False
+
+    global_agents_res = safe_resolve(global_agents, strict=True)
+    if global_agents_res is None:
+        print(f"ERROR: failed to resolve {global_agents}", file=sys.stderr)
+        return False
+
+    config_dir, _, _ = _agy_config_paths(home)
+    ancestor_err = _validate_dir_ancestors(config_dir, stop_at=home)
+    if ancestor_err is not None:
+        print(f"ERROR: cannot link {agents_md_path} ({ancestor_err}).", file=sys.stderr)
+        return False
+
+    config_dir_res = safe_resolve(config_dir, strict=False)
+    if config_dir_res is not None and (
+        config_dir_res == repo_root_res or config_dir_res.is_relative_to(repo_root_res)
+    ):
+        print(
+            f"ERROR: refusing to modify {agents_md_path} because {config_dir} resolves inside "
+            f"repository {repo_root_res}.",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        st = os.lstat(agents_md_path)
+    except FileNotFoundError:
+        is_link = False
+        exists = False
+        is_real_dir = False
+    except OSError as exc:
+        print(f"ERROR: cannot inspect {agents_md_path}: {exc}", file=sys.stderr)
+        return False
+    else:
+        is_link = stat.S_ISLNK(st.st_mode)
+        exists = _safe_exists(agents_md_path)
+        is_real_dir = (not is_link) and stat.S_ISDIR(st.st_mode)
+
+    if not is_link and not exists:
+        if dry_run:
+            print(f"[dry-run] Would symlink {agents_md_path} -> {global_agents_res}")
+            return True
+        try:
+            config_dir.mkdir(parents=True, exist_ok=True)
+            agents_md_path.symlink_to(global_agents_res)
+        except OSError as exc:
+            print(
+                f"ERROR: failed to symlink {agents_md_path} -> {global_agents_res}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        print(f"Linked {agents_md_path} -> {global_agents_res}")
+        return True
+
+    if is_link and exists and safe_resolve(agents_md_path, strict=True) == global_agents_res:
+        print(f"OK: {agents_md_path} already links to {global_agents_res}")
+        return True
+
+    if not replace:
+        kind = "symlink" if is_link else ("directory" if is_real_dir else "file")
+        print(
+            f"CONFLICT: {agents_md_path} already exists as a {kind}; leaving untouched "
+            "(re-run with --replace to back up and link, or pass --no-global-agents to skip).",
+            file=sys.stderr,
+        )
+        return False
+
+    if not is_link and exists:
+        existing_res = safe_resolve(agents_md_path, strict=True)
+        if (
+            existing_res is None
+            or _paths_overlap(existing_res, repo_root_res)
+            or _paths_overlap(existing_res, global_agents_res)
+        ):
+            print(
+                f"ERROR: refusing to back up {agents_md_path} because it overlaps "
+                f"repository {repo_root_res}.",
+                file=sys.stderr,
+            )
+            return False
+
+    if dry_run:
+        preview_backup = unique_backup_path(config_dir, agents_md_path.name, timestamp)
+        print(
+            f"[dry-run] Would move {agents_md_path} -> {preview_backup} "
+            f"and symlink {agents_md_path} -> {global_agents_res}"
+        )
+        return True
+
+    return _backup_and_symlink(
+        agents_md_path,
+        global_agents_res,
+        config_dir,
+        agents_md_path.name,
+        timestamp,
+        is_real_dir=is_real_dir,
+    )
+
+
+def _validate_replacement_repo_skill(
+    skill_name: str,
+    repo_skill_dir: Path,
+    *,
+    repo_root: Path,
+    repo_root_res: Path,
+    home: Path,
+    duplicate_names: set[str],
+    skills_json_path: Path,
+    skills_json_data: dict[str, object],
+) -> str | None:
+    """Validate that a repo skill safely replaces a shadowed skill; return error or None."""
+    if skill_name in duplicate_names:
+        return f"'{skill_name}' is duplicated in both shared/ and harnesses/agy/"
+    if not _is_skill_exposed_by_skills_json(skills_json_data, repo_skill_dir, home):
+        return f"{skills_json_path} filters out '{skill_name}' via include_only/exclude"
+    validation_errors = validate_skill_dir(repo_skill_dir) + _validate_skill_tree_symlinks(
+        repo_skill_dir, repo_root, repo_root_res
+    )
+    if validation_errors:
+        return f"repo skill {repo_skill_dir} failed validation: {'; '.join(validation_errors)}"
+    return None
+
+
 def _apply_agy_shadow_backups(
     repo_root: Path,
     repo_root_res: Path,
@@ -2025,43 +2841,11 @@ def _apply_agy_shadow_backups(
     if _validate_dir_ancestors(config_dir, stop_at=home) is not None:
         return True
 
-    try:
-        agy_dir_st = os.lstat(agy_skills_dir)
-    except FileNotFoundError:
-        return True
-    except OSError as exc:
-        print(f"ERROR: cannot inspect {agy_skills_dir}: {exc}", file=sys.stderr)
-        return False
-
-    if stat.S_ISLNK(agy_dir_st.st_mode):
-        raw_link = _safe_readlink(agy_skills_dir)
-        if not replace:
-            print(
-                f"WARNING: {agy_skills_dir} is a symlink (-> {raw_link}); "
-                "skipping loose-skill collision scan.",
-                file=sys.stderr,
-            )
-            return True
-        print(
-            f"ERROR: {agy_skills_dir} is a symlink (-> {raw_link}); "
-            "refusing to move entries through symlinked directory.",
-            file=sys.stderr,
-        )
-        return False
-
-    if not stat.S_ISDIR(agy_dir_st.st_mode):
-        if not replace:
-            print(
-                f"WARNING: {agy_skills_dir} exists as a non-directory file; "
-                "skipping loose-skill collision scan.",
-                file=sys.stderr,
-            )
-            return True
-        print(
-            f"ERROR: {agy_skills_dir} exists as a non-directory file; cannot inspect shadows.",
-            file=sys.stderr,
-        )
-        return False
+    should_scan, preflight_ok = _preflight_shadow_container_apply(
+        agy_skills_dir, "loose-skill", replace=replace
+    )
+    if not should_scan:
+        return preflight_ok
 
     repo_skill_map = discover_agy_repo_skills(repo_root)
     colliding, scan_err = _find_shadowing_agy_skills(home, repo_skill_map)
@@ -2105,15 +2889,6 @@ def _apply_agy_shadow_backups(
 
     try:
         for entry in colliding:
-            if entry.name in duplicate_names:
-                print(
-                    f"ERROR: refusing to move shadowing skill {entry} because '{entry.name}' "
-                    "is duplicated in both shared/ and harnesses/agy/.",
-                    file=sys.stderr,
-                )
-                ok = False
-                continue
-
             repo_skill_dir = repo_skill_map[entry.name]
 
             if not _safe_is_symlink(entry):
@@ -2132,22 +2907,19 @@ def _apply_agy_shadow_backups(
                     ok = False
                     continue
 
-            if not _is_skill_exposed_by_skills_json(skills_json_data, repo_skill_dir, home):
-                print(
-                    f"ERROR: refusing to move shadowing skill {entry} because {skills_json_path} "
-                    f"filters out '{entry.name}' via include_only/exclude.",
-                    file=sys.stderr,
-                )
-                ok = False
-                continue
-
-            validation_errors = validate_skill_dir(repo_skill_dir) + _validate_skill_tree_symlinks(
-                repo_skill_dir, repo_root, repo_root_res
+            rep_err = _validate_replacement_repo_skill(
+                entry.name,
+                repo_skill_dir,
+                repo_root=repo_root,
+                repo_root_res=repo_root_res,
+                home=home,
+                duplicate_names=duplicate_names,
+                skills_json_path=skills_json_path,
+                skills_json_data=skills_json_data,
             )
-            if validation_errors:
+            if rep_err is not None:
                 print(
-                    f"ERROR: refusing to move shadowing skill {entry} because repo skill "
-                    f"{repo_skill_dir} failed validation: {'; '.join(validation_errors)}",
+                    f"ERROR: refusing to move shadowing skill {entry} because {rep_err}.",
                     file=sys.stderr,
                 )
                 ok = False
@@ -2191,8 +2963,175 @@ def _apply_agy_shadow_backups(
     return ok
 
 
-def cmd_apply(repo_root: Path, home: Path, *, dry_run: bool, replace: bool) -> int:
-    """Link ~/.agents/skills -> shared/ and non-destructively configure Antigravity skills.json."""
+def _apply_agy_plugin_shadow_backups(
+    repo_root: Path,
+    repo_root_res: Path,
+    home: Path,
+    timestamp: str,
+    *,
+    skills_json_ready: bool,
+    skills_json_data: dict[str, object] | None,
+    dry_run: bool,
+    replace: bool,
+) -> bool:
+    """Detect or safely back up non-marketplace local plugins shadowing repo skills."""
+    config_dir, skills_json_path, _ = _agy_config_paths(home)
+    plugins_dir = _agy_plugins_dir(home)
+    if _validate_dir_ancestors(config_dir, stop_at=home) is not None:
+        return True
+
+    should_scan, preflight_ok = _preflight_shadow_container_apply(
+        plugins_dir, "local-plugin", replace=replace
+    )
+    if not should_scan:
+        return preflight_ok
+
+    repo_skill_map = discover_agy_repo_skills(repo_root)
+    shadowing_plugins, scan_err = _find_shadowing_agy_plugins(home, repo_skill_map)
+    if scan_err is not None:
+        print(f"ERROR: {scan_err}", file=sys.stderr)
+        return False
+    if not shadowing_plugins:
+        return True
+
+    if not replace:
+        details = "; ".join(
+            f"{sp.plugin_path.name} ({', '.join(sp.colliding_skills)})"
+            for sp in shadowing_plugins
+        )
+        print(
+            f"WARNING: local plugins in {plugins_dir} shadow repo skills: "
+            f"{details}. Re-run with --replace to back them up.",
+            file=sys.stderr,
+        )
+        return True
+
+    plugins_res = safe_resolve(plugins_dir, strict=True)
+    if plugins_res is None or _paths_overlap(plugins_res, repo_root_res):
+        print(
+            f"ERROR: refusing to move plugins from {plugins_dir} because it overlaps "
+            f"repository {repo_root_res}.",
+            file=sys.stderr,
+        )
+        return False
+
+    if not skills_json_ready or skills_json_data is None:
+        names = ", ".join(sp.plugin_path.name for sp in shadowing_plugins)
+        print(
+            f"WARNING: refusing to move shadowing plugins ({names}) because "
+            f"{skills_json_path} was not updated.",
+            file=sys.stderr,
+        )
+        return False
+
+    duplicate_names = _duplicate_agy_skill_names(repo_root)
+    ok = True
+    backup_dir: Path | None = None
+    moved_count = 0
+
+    try:
+        for sp in shadowing_plugins:
+            if sp.extra_unmigrated_skills or sp.extra_runtime_components:
+                reasons: list[str] = []
+                if sp.extra_unmigrated_skills:
+                    reasons.append(
+                        f"unmigrated skills not in repo: {', '.join(sp.extra_unmigrated_skills)}"
+                    )
+                if sp.extra_runtime_components:
+                    reasons.append(
+                        "non-skill runtime components: "
+                        f"{', '.join(sp.extra_runtime_components)}"
+                    )
+                print(
+                    f"ERROR: refusing to move shadowing plugin {sp.plugin_path} because it "
+                    f"contains {'; '.join(reasons)}.",
+                    file=sys.stderr,
+                )
+                ok = False
+                continue
+
+            if not _safe_is_symlink(sp.plugin_path):
+                plugin_res = safe_resolve(sp.plugin_path, strict=True)
+                if plugin_res is None or _paths_overlap(plugin_res, repo_root_res):
+                    print(
+                        f"ERROR: refusing to move shadowing plugin {sp.plugin_path} because it "
+                        f"overlaps repository {repo_root_res}.",
+                        file=sys.stderr,
+                    )
+                    ok = False
+                    continue
+
+            plugin_valid = True
+            for skill_name in sp.colliding_skills:
+                rep_err = _validate_replacement_repo_skill(
+                    skill_name,
+                    repo_skill_map[skill_name],
+                    repo_root=repo_root,
+                    repo_root_res=repo_root_res,
+                    home=home,
+                    duplicate_names=duplicate_names,
+                    skills_json_path=skills_json_path,
+                    skills_json_data=skills_json_data,
+                )
+                if rep_err is not None:
+                    print(
+                        f"ERROR: refusing to move shadowing plugin {sp.plugin_path} because "
+                        f"{rep_err}.",
+                        file=sys.stderr,
+                    )
+                    plugin_valid = False
+                    break
+            if not plugin_valid:
+                ok = False
+                continue
+
+            if backup_dir is None:
+                if dry_run:
+                    backup_dir = unique_backup_path(config_dir, "plugins", timestamp)
+                else:
+                    try:
+                        backup_dir = _create_unique_backup_dir(config_dir, "plugins", timestamp)
+                    except OSError as exc:
+                        print(
+                            f"ERROR: failed to create backup directory in {config_dir}: {exc}",
+                            file=sys.stderr,
+                        )
+                        return False
+
+            dest = backup_dir / sp.plugin_path.name
+            if dry_run:
+                print(f"[dry-run] Would move shadowing plugin {sp.plugin_path} -> {dest}")
+                continue
+
+            try:
+                _move_entry_to_backup(sp.plugin_path, dest, backup_dir)
+            except OSError as exc:
+                print(
+                    f"ERROR: failed to back up shadowing plugin {sp.plugin_path} -> {dest}: {exc}",
+                    file=sys.stderr,
+                )
+                ok = False
+                continue
+
+            moved_count += 1
+            print(f"Backed up shadowing plugin {sp.plugin_path} -> {dest}")
+    finally:
+        if backup_dir is not None and not dry_run and moved_count == 0:
+            with contextlib.suppress(OSError):
+                backup_dir.rmdir()
+
+    return ok
+
+
+def cmd_apply(
+    repo_root: Path,
+    home: Path,
+    *,
+    dry_run: bool,
+    replace: bool,
+    no_global_agents: bool = False,
+) -> int:
+    """Link ~/.agents/skills -> shared/, link global AGENTS.md, and configure skills.json."""
     home_err = _validate_dir_ancestors(home)
     if home_err is not None:
         print(f"ERROR: invalid home path ({home_err})", file=sys.stderr)
@@ -2222,8 +3161,22 @@ def cmd_apply(repo_root: Path, home: Path, *, dry_run: bool, replace: bool) -> i
     agents_ok = _apply_agents_symlink(
         repo_root_res, shared_res, home, timestamp, dry_run=dry_run, replace=replace
     )
+    virtual_agents_target = shared_res if (dry_run and agents_ok) else None
     skills_json_ready, skills_json_data = _apply_agy_skills_json(
-        repo_root, repo_root_res, home, dry_run=dry_run
+        repo_root,
+        repo_root_res,
+        home,
+        dry_run=dry_run,
+        virtual_agents_target=virtual_agents_target,
+    )
+    global_agents_ok = _apply_agy_global_agents(
+        repo_root,
+        repo_root_res,
+        home,
+        timestamp,
+        dry_run=dry_run,
+        replace=replace,
+        no_global_agents=no_global_agents,
     )
     shadows_ok = _apply_agy_shadow_backups(
         repo_root,
@@ -2235,7 +3188,27 @@ def cmd_apply(repo_root: Path, home: Path, *, dry_run: bool, replace: bool) -> i
         dry_run=dry_run,
         replace=replace,
     )
-    return 0 if (agents_ok and skills_json_ready and shadows_ok) else 1
+    plugin_shadows_ok = _apply_agy_plugin_shadow_backups(
+        repo_root,
+        repo_root_res,
+        home,
+        timestamp,
+        skills_json_ready=skills_json_ready,
+        skills_json_data=skills_json_data,
+        dry_run=dry_run,
+        replace=replace,
+    )
+    return (
+        0
+        if (
+            agents_ok
+            and skills_json_ready
+            and global_agents_ok
+            and shadows_ok
+            and plugin_shadows_ok
+        )
+        else 1
+    )
 
 
 def _find_cross_scope_duplicate(repo_root: Path, scope: str, name: str) -> Path | None:
@@ -2922,6 +3895,48 @@ def _check_skill_container(container: Path, repo_root: Path) -> tuple[set[str], 
     return (skill_names, errors)
 
 
+def _check_global_agents(repo_root: Path, repo_root_res: Path) -> list[str]:
+    """Validate global/ container and global/AGENTS.md regular UTF-8 file <= 24,000 bytes."""
+    container_err = _validate_in_repo_container(repo_root_res, ("global",))
+    if container_err is not None:
+        return [f"global: {container_err}"]
+
+    global_agents = repo_root / "global" / "AGENTS.md"
+    try:
+        st = os.lstat(global_agents)
+    except FileNotFoundError:
+        return ["global/AGENTS.md: missing global rules file"]
+    except OSError as exc:
+        return [f"global/AGENTS.md: inaccessible: {exc}"]
+
+    if stat.S_ISLNK(st.st_mode):
+        return ["global/AGENTS.md: must be a regular file, not a symlink"]
+    if not stat.S_ISREG(st.st_mode):
+        return ["global/AGENTS.md: must be a regular file"]
+
+    try:
+        raw_bytes = global_agents.read_bytes()
+    except OSError as exc:
+        return [f"global/AGENTS.md: failed to read file: {exc}"]
+
+    errors: list[str] = []
+    size = len(raw_bytes)
+    if size > GLOBAL_AGENTS_MAX_BYTES:
+        errors.append(
+            f"global/AGENTS.md: file size ({size} bytes) exceeds "
+            f"{GLOBAL_AGENTS_MAX_BYTES}-byte limit"
+        )
+    try:
+        text = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        errors.append(f"global/AGENTS.md: failed to read UTF-8 text: {exc}")
+        return errors
+
+    if not text.strip():
+        errors.append("global/AGENTS.md: file must not be empty")
+    return errors
+
+
 def cmd_doctor(repo_root: Path) -> int:
     """Run repository integrity checks without mutating the repository."""
     if not _safe_is_dir(repo_root):
@@ -2946,6 +3961,9 @@ def cmd_doctor(repo_root: Path) -> int:
     ):
         rel = nested_git.relative_to(repo_root).as_posix()
         errors.append(f"{rel}: nested .git entry is not allowed inside repository")
+
+    # Global AGENTS.md validation
+    errors.extend(_check_global_agents(repo_root, repo_root_res))
 
     # Skill frontmatter & structure across shared/* and harnesses/*/*
     shared_names, shared_errs = _check_skill_container(repo_root / "shared", repo_root)
@@ -3138,7 +4156,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     apply_parser = subparsers.add_parser(
         "apply",
-        help="Link ~/.agents/skills -> shared/ and merge Antigravity skills.json.",
+        help=(
+            "Link ~/.agents/skills -> shared/, link global AGENTS.md, "
+            "and merge Antigravity skills.json."
+        ),
     )
     _add_repo_arg(apply_parser)
     apply_parser.add_argument(
@@ -3149,7 +4170,17 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser.add_argument(
         "--replace",
         action="store_true",
-        help="Back up conflicting ~/.agents/skills and colliding ~/.gemini/config/skills entries.",
+        help=(
+            "Back up conflicting ~/.agents/skills, ~/.gemini/config/AGENTS.md, "
+            "and colliding skills/plugins entries."
+        ),
+    )
+    apply_parser.add_argument(
+        "--no-global-agents",
+        "--skip-global-agents",
+        dest="no_global_agents",
+        action="store_true",
+        help="Do not install or overwrite ~/.gemini/config/AGENTS.md.",
     )
     apply_parser.add_argument(
         "--home",
@@ -3228,7 +4259,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         home = _resolve_cli_dir(args.home, Path.home(), "--home")
         if home is None:
             return 1
-        return cmd_apply(repo_root, home, dry_run=args.dry_run, replace=args.replace)
+        return cmd_apply(
+            repo_root,
+            home,
+            dry_run=args.dry_run,
+            replace=args.replace,
+            no_global_agents=args.no_global_agents,
+        )
 
     if args.command == "adopt":
         return cmd_adopt(repo_root, args.source_dir, scope=args.scope, force=args.force)

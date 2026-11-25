@@ -2,10 +2,12 @@
 name: review
 description: >-
   Run a right-sized, diff-scoped multi-agent code review using specialist
-  reviewers pinned across Carbon (High) and Neon (xhigh) for correctness,
-  caller contracts, DRY/code health, calibrated security/adversarial edge cases,
-  and conditional C++/unsafe Rust soundness. Use when the user invokes /review
-  or asks to review code, changes, diffs, commits, branches, or pull requests.
+  reviewers pinned across Carbon (High) (correctness, conditional C++/unsafe
+  Rust safety, and Small-diff sole adversarial review) and Neon (xhigh)
+  (Standard/Large-diff adversarial review and optional large-diff verification)
+  for caller contracts, DRY/code health, calibrated security/adversarial edge
+  cases, and systems soundness. Use when the user invokes /review or asks to
+  review code, changes, diffs, commits, branches, or pull requests.
 ---
 
 # Right-Sized Multi-Agent Code Review (`/review` — Antigravity Adapter)
@@ -32,9 +34,10 @@ Call `swarm{action: "models", all: true}` to resolve exact frontier model names:
 
 | Tier Variable | Match Rule (Case-Insensitive) | Bound `algorithm.md` Personas |
 | :--- | :--- | :--- |
-| **`CARBON_HIGH`** | `Carbon` + `High` (e.g. `Gemini 4 Carbon (High)`) | `Correctness` (`cor`) |
-| **`NEON_XHIGH`** | `Neon` + `xhigh` / `XHigh` / `Extra High` | `Adversarial` (`adv`), conditional `Safety` (`saf`), optional large-diff `Verifier` (`ver`) |
+| **`CARBON_HIGH`** | `Carbon` + `High` (e.g. `Gemini 4 Carbon (High)`) | `Correctness` (`cor`), conditional `Safety` (`saf`), **and** `Adversarial` (`adv`) on **Small diffs** (`<= 3` files & `<= 120` lines, where `adv` is the sole spawned specialist worker) |
+| **`NEON_XHIGH`** | `Neon` + `xhigh` / `XHigh` / `Extra High` | `Adversarial` (`adv`) on **Standard & Large diffs** (paired in parallel with `CARBON_HIGH` `Correctness`), plus optional large-diff `Verifier` (`ver`) |
 
+- **Cross-model review guarantee**: Pinning `Correctness`, `Safety`, and Small-diff sole `Adversarial` to `CARBON_HIGH` guarantees every diff reviewed by `/review` (including Small diffs written by a `NEON_XHIGH` `Coder`) receives independent `CARBON_HIGH` eyes.
 - **Quota fallback (`SWITCH_MODEL`)**: If one frontier tier is completely out of quota (and not covered by AI credits), inform the user (Standalone Mode) and cross-pin affected workers `CARBON_HIGH <-> NEON_XHIGH`. On a mid-run quota hit, switch in place via `swarm{action: "model", name: "<worker>", model: "<other_pin>"}` rather than killing. **Never** silently downgrade reviewers to `flash` or `flash_lite`.
 - **Disabled `swarm` plugin**: Tell the user per-agent pinning requires [swarm](customization://swarm) and ask whether to enable it first or fall back to `invoke_subagent(..., Model="pro")`.
 
@@ -43,15 +46,15 @@ Call `swarm{action: "models", all: true}` to resolve exact frontier model names:
 1. **Standalone Coordinator Mode (Default — user invoked `/review` directly)**:
    - Call `swarm{action: "title", title: "Code Review: <concise target>"}` (if an unrelated swarm is active, prefix worker names `rev-` and use `#review` channel if supported).
    - Set `<CALLER>` to `@coordinator` so every helper posts `@coordinator [done]`.
-   - Execute the diff-scale tier in [algorithm.md](./core/algorithm.md) (`1` worker on Small diffs `<= 3` files & `<= 120` lines, `2–3` workers on Standard diffs, `<= 6` sharded workers on Large diffs `> 20` files or `> 2,500` lines), verify claims inline against [verifier.md](./core/playbooks/verifier.md), post `[done] Review complete` (no `@`) if a monitor is active, kill all helpers, remove `<SUMMARY_DIR>` (and any `<TMP_COLLECT>`), and present the report (writing to `<artifactDir>` only if `> 8` verified findings exist).
+   - Execute the diff-scale tier in [algorithm.md](./core/algorithm.md) (`1` `CARBON_HIGH` worker on Small diffs `<= 3` files & `<= 120` lines, `2–3` workers on Standard diffs, `<= 6` sharded workers on Large diffs `> 20` files or `> 2,500` lines), verify claims inline against [verifier.md](./core/playbooks/verifier.md), post `[done] Review complete` (no `@`) if a monitor is active, kill all helpers, remove `<SUMMARY_DIR>` (and any `<TMP_COLLECT>`), and present the report (writing to `<artifactDir>` only if `> 8` verified findings exist).
 2. **Embedded Swarm Worker Mode (e.g. `reviewer-1` or `rev-1-seam` inside `/dev-swarm`)**:
    - **Never** call `swarm{action: "title"}` (coordinator-only).
-   - Pass `--repo "<WORKTREE_PATH>" --working` (or `--repo "<REPO_ROOT>" --staged` on seam gates) to the collector.
+   - Pass `--repo "<WORKTREE_PATH>" --working [-- <slice-files>]` (adding `-- <slice-files>` on in-place runs with unrelated dirty paths, or `--repo "<REPO_ROOT>" --staged` on seam gates) to the collector.
    - Namespace helpers `<prefix>-p<pass>-{cor,adv,saf,ver}` (`<= 24` chars total, e.g. `r1-1-p1-adv` or `r1s-p1-cor`; place in `#rev-<your-member-name>` channel if supported).
    - Set `<CALLER>` to `@<your-member-name>`. **Spurious wakeup guard**: never write literal `@` immediately before `coordinator` in helper `brief`s or intermediate posts (say `"the swarm coordinator"` in prose).
    - **Pass 1 Gate -> Pass 2+ Direct Delta Verification**:
      - *Pass 1*: Run the right-sized multi-agent `/review` gate once, verify zero leaked meta-comments, run build/lint/tests once yourself, and `kill` all helpers immediately. Approve right away in Pass 1 if zero in-scope `[MUST-FIX]` issues exist.
-     - *Pass 2+ (`[fixed]`)*: Verify the fix delta and tests **directly yourself without re-spawning helpers** (spawning at most 1 targeted `NEON_XHIGH` `saf` or `adv` helper only if a fix rewrote `> 150` lines or added new `unsafe`/C++/FFI/crypto code).
+     - *Pass 2+ (`[fixed]`)*: Verify the fix delta and tests **directly yourself without re-spawning helpers** (spawning at most 1 targeted helper only if a fix rewrote `> 150` lines or added new `unsafe`/C++/FFI/crypto code—pinning `saf` to `CARBON_HIGH`, or `adv` to `CARBON_HIGH` on Small diffs / `NEON_XHIGH` otherwise).
      - *Scope discipline*: Never demand out-of-scope fixes to untouched pre-existing code or move goalposts onto unchanged Pass 1 code.
 
 ## `SPAWN_WORKER`, `HANDOFF`, `READ_ARTIFACT` & Cleanup Bindings

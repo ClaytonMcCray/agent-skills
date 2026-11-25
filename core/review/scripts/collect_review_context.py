@@ -137,6 +137,7 @@ _FFI_RE = re.compile(
     r"|unsafe\.Pointer"
     r"|DllImport"
     r"|Napi::"
+    r"|(?<![A-Za-z0-9_])(?:ioctl|syscall|mmap|mprotect|copy_from_user|copy_to_user)[ \t]*\("
 )
 
 _CONCURRENCY_RE = re.compile(
@@ -1075,7 +1076,7 @@ def _write_single_untracked_preview(
             return 0
         fh.seek(0)
 
-        header = f"\n=== UNTRACKED NEW FILE: {_display_path(rel_path)} ===\n".encode("utf-8")
+        header = f"\n=== UNTRACKED NEW FILE: {_display_path(rel_path)} ===\n".encode()
         out_fh.write(header)
         lines_written += 2
 
@@ -1127,7 +1128,7 @@ def _write_single_untracked_preview(
             text_line = _display_path(kept.decode("utf-8", errors="replace"))
             if truncated:
                 text_line += " ... [truncated]"
-            out_fh.write(f"{lineno:6d}\t{text_line}\n".encode("utf-8"))
+            out_fh.write(f"{lineno:6d}\t{text_line}\n".encode())
             lines_written += 1
 
     return lines_written
@@ -1229,7 +1230,10 @@ def _scan_files_for_languages_and_hazards(
                                 ):
                                     line_unsafe = True
                                     break
-                        if not line_ffi and _FFI_RE.search(raw_window):
+                        if not line_ffi and any(
+                            not has_left_cut or m.start() > 0
+                            for m in _FFI_RE.finditer(raw_window)
+                        ):
                             line_ffi = True
                         if not line_conc and _CONCURRENCY_RE.search(raw_window):
                             line_conc = True
