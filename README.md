@@ -8,12 +8,26 @@ Single, multi-machine source of truth for agent skills across macOS and Linux. S
 - `shared/` — Universal single-agent skills exposed directly through `~/.agents/skills` (for example,
   [shared/hey/SKILL.md](./shared/hey/SKILL.md)).
 - `core/` — Harness- and model-agnostic orchestration workflows, personas, domain review playbooks,
-  and stdlib-only Python helper scripts (such as `core/review/` and `core/dev-swarm/`).
+  and stdlib-only Python helper scripts:
+  - [core/review/](./core/review/) (context collector:
+    [collect_review_context.py](./core/review/scripts/collect_review_context.py))
+  - [core/dev-swarm/](./core/dev-swarm/) (worktree manager:
+    [manage_worktree.py](./core/dev-swarm/scripts/manage_worktree.py))
 - `harnesses/agy/` — Thin Antigravity adapters binding concrete models and native tools to `core/`
-  via relative symlinks (such as `harnesses/agy/review/` and `harnesses/agy/dev-swarm/`).
+  via relative symlinks:
+  - [harnesses/agy/review/SKILL.md](./harnesses/agy/review/SKILL.md)
+  - [harnesses/agy/dev-swarm/SKILL.md](./harnesses/agy/dev-swarm/SKILL.md)
 - [init.py](./init.py) — Stdlib-only Python CLI for inspecting status, applying machine bindings,
   adopting loose skills, and running repository integrity checks.
 - [pyproject.toml](./pyproject.toml) — Python 3.11+ project metadata and `pytest`/`ruff` config.
+
+## Included Skills
+
+| Skill | Scope | Entry Point | Purpose |
+| :--- | :--- | :--- | :--- |
+| `hey` | Universal (`shared/`) | [shared/hey/SKILL.md](./shared/hey/SKILL.md) | Interact with HEY email, Feed, Paper Trail, and calendar via `hey` CLI |
+| `review` | Antigravity (`harnesses/agy/`) | [harnesses/agy/review/SKILL.md](./harnesses/agy/review/SKILL.md) | Multi-agent security, adversarial, C++/Rust safety, correctness, and DRY code review |
+| `dev-swarm` | Antigravity (`harnesses/agy/`) | [harnesses/agy/dev-swarm/SKILL.md](./harnesses/agy/dev-swarm/SKILL.md) | Autonomous local research -> plan/critic -> worktree code/review -> clean-room commit swarm |
 
 ## Multi-Machine Setup
 
