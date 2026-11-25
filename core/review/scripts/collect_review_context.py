@@ -101,6 +101,24 @@ _CPP_SUFFIXES = frozenset(
     }
 )
 
+_PROSE_AND_DATA_SUFFIXES = frozenset(
+    {
+        ".md",
+        ".markdown",
+        ".txt",
+        ".rst",
+        ".adoc",
+        ".json",
+        ".yaml",
+        ".yml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".csv",
+        ".lock",
+    }
+)
+
 _UNSAFE_WORD_RE = re.compile(r"(?<![A-Za-z0-9_])unsafe(?![A-Za-z0-9_])")
 _UNSAFE_WORD_BYTES_RE = re.compile(rb"(?<![A-Za-z0-9_])unsafe(?![A-Za-z0-9_])")
 _CONTROL_CHAR_RE = re.compile(
@@ -156,6 +174,7 @@ _HAZARD_CHUNK_BYTES = 65536
 _HAZARD_OVERLAP_BYTES = 64
 _MAX_HAZARD_SNIPPET_BYTES = 512
 _MAX_SUMMARY_HAZARD_LINES = 80
+_MAX_REPO_FILES_LINES = 5000
 
 _FILTER_ACTION_SUFFIXES = frozenset({b"clean", b"smudge", b"process", b"required"})
 _SCOPED_PATH_CONFIG_KEYS: tuple[tuple[bytes, str], ...] = (
@@ -1167,6 +1186,8 @@ def _scan_files_for_languages_and_hazards(
                 cpp_files.append(rel_path)
             elif is_rust:
                 has_rust = True
+            elif suffix in _PROSE_AND_DATA_SUFFIXES:
+                continue
 
             fh = _open_confined_regular_file(repo_root_res, rel_path)
             if fh is None:
@@ -1290,6 +1311,7 @@ def _write_non_git_bundle(
     files = _collect_non_git_files(start_dir_res, targets)
     display_files = [_display_path(f) for f in files]
     _write_lines(out_dir / "changed_files.txt", display_files)
+    _write_lines(out_dir / "repo_files.txt", display_files[:_MAX_REPO_FILES_LINES])
 
     summary_lines = [
         f"SUMMARY_DIR={_display_path(str(out_dir))}",
@@ -1598,6 +1620,14 @@ def _write_git_bundle(
     display_changed = [_display_path(f) for f in changed_files]
     _write_lines(out_dir / "changed_files.txt", display_changed)
 
+    tracked_files = sorted({f for f in git_ctx.z_paths(["ls-files", "-z"]) if f})
+    repo_inventory = [_display_path(f) for f in tracked_files[:_MAX_REPO_FILES_LINES]]
+    if len(tracked_files) > _MAX_REPO_FILES_LINES:
+        repo_inventory.append(
+            f"... ({len(tracked_files) - _MAX_REPO_FILES_LINES} more tracked files omitted)"
+        )
+    _write_lines(out_dir / "repo_files.txt", repo_inventory)
+
     diff_lines = _write_diff_and_untracked_previews(
         out_dir / "diff.patch",
         git_diff_bytes,
@@ -1801,6 +1831,7 @@ def _run_main(argv: Sequence[str] | None, *, redirect_broken_pipe_fd: bool) -> i
         for filename in (
             "diff.patch",
             "changed_files.txt",
+            "repo_files.txt",
             "untracked_files.txt",
             "hazard_hits.txt",
             "summary.txt",

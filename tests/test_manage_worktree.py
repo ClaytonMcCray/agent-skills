@@ -1540,7 +1540,11 @@ def test_dev_swarm_skill_artifacts_token_isolation_and_init_integration(tmp_path
     cr_text = (core_dir / "personas" / "coder-reviewer.md").read_text(encoding="utf-8")
     assert "Multi-Coder Seam Reviewer" in cr_text and "4 review cycles" in cr_text
     assert "### Context Collection" in cr_text
-    assert cr_text.index("### Context Collection") < cr_text.index("1. **Fast-Track Pass")
+    assert cr_text.index("### Context Collection") < cr_text.index(
+        "1. **Pass 1 — Right-Sized Multi-Agent `/review` Gate"
+    )
+    assert "Pass 2+ — Direct Delta Verification" in cr_text
+    assert "No Goalpost-Moving" in cr_text
 
     cc_text = (core_dir / "personas" / "cleanroom-commit.md").read_text(encoding="utf-8")
     assert "git reflog" in cc_text and "mktemp /tmp/commit-msg.XXXXXX" in cc_text

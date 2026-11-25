@@ -253,6 +253,7 @@ def test_default_tmp_bundle_permissions_error_cleanup_and_broken_pipe(
         for expected_file in (
             "diff.patch",
             "changed_files.txt",
+            "repo_files.txt",
             "untracked_files.txt",
             "hazard_hits.txt",
             "summary.txt",
@@ -1103,7 +1104,14 @@ def test_cpp_suffixes_rust_unsafe_scoping_and_hazard_cap(tmp_path: Path) -> None
     for idx, ext in enumerate(cpp_exts):
         (repo / f"f{idx}{ext}").write_text("int x = 0;\n", encoding="utf-8")
 
-    (repo / "README.md").write_text("Do not use unsafe operations.\n", encoding="utf-8")
+    (repo / "README.md").write_text(
+        'Do not use unsafe operations or extern "C" or AtomicUsize or transmute.\n',
+        encoding="utf-8",
+    )
+    (repo / "config.json").write_text(
+        '{"note": "UnsafeCell ctypes pthread_create"}\n',
+        encoding="utf-8",
+    )
     (repo / "note.py").write_text('MSG = "unsafe pattern"\n', encoding="utf-8")
     _commit_all(repo, "init")
 
@@ -1111,6 +1119,10 @@ def test_cpp_suffixes_rust_unsafe_scoping_and_hazard_cap(tmp_path: Path) -> None
     assert kv["HAS_CPP"] == "1"
     assert kv["HAS_RUST"] == "0"
     assert kv["HAS_RUST_UNSAFE"] == "0"
+    assert kv["HAS_FFI"] == "0"
+    assert kv["HAS_CONCURRENCY_HAZARDS"] == "0"
+    repo_files = (sdir / "repo_files.txt").read_text(encoding="utf-8").splitlines()
+    assert "README.md" in repo_files and "note.py" in repo_files
     summary_text = (sdir / "summary.txt").read_text(encoding="utf-8")
     for idx, ext in enumerate(cpp_exts):
         assert f"f{idx}{ext}" in summary_text
@@ -1207,7 +1219,23 @@ def test_review_skill_artifacts_token_isolation_and_adapter_contract() -> None:
     scanned_files = sorted(
         p for p in core_dir.rglob("*") if p.is_file() and "__pycache__" not in p.parts
     )
-    assert len(scanned_files) == 8
+    expected_core = {
+        core_dir / "algorithm.md",
+        core_dir / "playbooks" / "correctness-style.md",
+        core_dir / "playbooks" / "security-adversarial.md",
+        core_dir / "playbooks" / "safety-cpp-rust.md",
+        core_dir / "playbooks" / "verifier.md",
+        SCRIPT_PATH,
+    }
+    assert set(scanned_files) == expected_core
+
+    # Verify scope-discipline, threat-model calibration, and right-sized tiering invariants
+    algo_text = (core_dir / "algorithm.md").read_text(encoding="utf-8")
+    assert "Out-of-Scope Notes" in algo_text
+    assert "Small Diff" in algo_text and "Standard Diff" in algo_text and "Large Diff" in algo_text
+    assert "Direct Delta Check" in algo_text and "No Goalpost-Moving" in algo_text
+    sec_adv_text = (core_dir / "playbooks" / "security-adversarial.md").read_text(encoding="utf-8")
+    assert "Local Developer CLI" in sec_adv_text and "Proportional" in sec_adv_text
     for path in scanned_files:
         text = path.read_text(encoding="utf-8").replace("agy-review.", "<TMP_PREFIX>")
         for label, pattern in forbidden_patterns:

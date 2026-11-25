@@ -46,13 +46,11 @@ agent-skills/
 │   │   └── scripts/
 │   │       └── manage_worktree.py     # Python port of worktree create / status / apply / cleanup
 │   └── review/
-│       ├── algorithm.md               # Phase 1 parallel specialists -> Phase 2 skeptical verifier
+│       ├── algorithm.md               # Right-sized, diff-scoped specialist fan-out + inline verification
 │       ├── playbooks/
-│       │   ├── security.md
-│       │   ├── adversarial.md
+│       │   ├── correctness-style.md
+│       │   ├── security-adversarial.md
 │       │   ├── safety-cpp-rust.md
-│       │   ├── correctness.md
-│       │   ├── style-dedup.md
 │       │   └── verifier.md
 │       └── scripts/
 │           └── collect_review_context.py  # Python port of git diff/untracked/C++/unsafe-Rust collector
@@ -79,7 +77,7 @@ agent-skills/
 
 Files under `core/` must **not** hardcode Antigravity-specific tool or model names (`swarm_wait`, `read_board`, `#seq`, `@coordinator`, `Carbon High`, `Neon xhigh`, `Opus 5.5 High`). Instead, `core/*.md` writes against five abstract concepts whose concrete bindings are supplied by the harness's `SKILL.md` (and passed into spawned workers' startup briefs):
 
-1. **`MODEL_MAP`**: Maps abstract personas (`Researcher-Broad`, `Researcher-Deep`, `Planner`, `Critic`, `Coder`, `Reviewer`, `Commit-Reviewer`, `Commit-Writer`, and `/review`'s `Security`, `Adversarial`, `Safety`, `Safety-Holistic`, `Correctness`, `Style`, `Verifier`) to concrete harness model identifiers, with a no-flash-downgrade quota fallback rule.
+1. **`MODEL_MAP`**: Maps abstract personas (`Researcher-Broad`, `Researcher-Deep`, `Planner`, `Critic`, `Coder`, `Reviewer`, `Commit-Reviewer`, `Commit-Writer`, and `/review`'s `Correctness`, `Adversarial`, `Safety`, `Verifier`) to concrete harness model identifiers, with a no-flash-downgrade quota fallback rule.
 2. **`SPAWN_WORKER` & Lifecycle**: How the Lead Agent (or Paired Reviewer running `/review`) starts, monitors, model-switches on quota exhaustion, and cleans up workers.
 3. **`HANDOFF(recipient, status_tag, payload)` & `READ_ARTIFACT(ref)`**: How workers pass artifacts/verdicts peer-to-peer (`Planner <-> Critic`, `Coder <-> Reviewer`) or escalate to the Lead Agent without re-copying huge payloads.
 4. **`CLEANROOM_BARRIER` (Stage 4 Air-Gap)**:
