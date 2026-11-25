@@ -32,10 +32,11 @@ class HarnessSpec:
     name: str
     repo_rel_dir: str
     config_rel_dir: str
-    skills_json_name: str
     skills_dir_name: str
-    plugins_dir_name: str = "plugins"
-    config_json_name: str = "config.json"
+    install_mode: str = "symlink_farm"
+    skills_json_name: str | None = None
+    plugins_dir_name: str | None = None
+    config_json_name: str | None = None
     global_agents_name: str = "AGENTS.md"
 
 
@@ -53,12 +54,34 @@ HARNESS_REGISTRY: dict[str, HarnessSpec] = {
         name="agy",
         repo_rel_dir="harnesses/agy",
         config_rel_dir=".gemini/config",
-        skills_json_name="skills.json",
         skills_dir_name="skills",
+        install_mode="agy_json",
+        skills_json_name="skills.json",
         plugins_dir_name="plugins",
         config_json_name="config.json",
         global_agents_name="AGENTS.md",
     ),
+    "claude": HarnessSpec(
+        name="claude",
+        repo_rel_dir="harnesses/claude",
+        config_rel_dir=".claude",
+        skills_dir_name="skills",
+        install_mode="symlink_farm",
+        global_agents_name="CLAUDE.md",
+    ),
+    "codex": HarnessSpec(
+        name="codex",
+        repo_rel_dir="harnesses/codex",
+        config_rel_dir=".codex",
+        skills_dir_name="skills",
+        install_mode="symlink_farm",
+        global_agents_name="AGENTS.md",
+    ),
+}
+
+PRESERVED_SKILL_DIR_ENTRIES: dict[str, frozenset[str]] = {
+    "claude": frozenset({"synced"}),
+    "codex": frozenset(),
 }
 
 KEBAB_CASE_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -89,7 +112,7 @@ PRUNED_ENTRY_NAMES = frozenset(
         ".DS_Store",
     }
 )
-PATH_SCAN_SUFFIXES = frozenset({".md", ".py", ".json"})
+PATH_SCAN_SUFFIXES = frozenset({".md", ".py", ".json", ".toml"})
 COMMONMARK_ASCII_PUNCT = frozenset(r"""!"#$%&'()*+,-./:;<=>?@[\]^_`{|}~""")
 YAML_TOKEN_BOUNDARIES = frozenset({" ", "\t", "[", "{", ",", ":"})
 MAX_FLOW_DEPTH = 32
@@ -191,10 +214,40 @@ def _iter_visible_entries(directory: Path) -> list[Path]:
     return entries
 
 
+def _harness_config_dir(home: Path, spec: HarnessSpec) -> Path:
+    return home / spec.config_rel_dir
+
+
+def _harness_skills_dir(home: Path, spec: HarnessSpec) -> Path:
+    return home / spec.config_rel_dir / spec.skills_dir_name
+
+
+def _harness_global_agents_path(home: Path, spec: HarnessSpec) -> Path:
+    return home / spec.config_rel_dir / spec.global_agents_name
+
+
+def _harness_display_prefix(spec: HarnessSpec) -> str:
+    return f"~/{spec.config_rel_dir}"
+
+
+def _preserved_skill_entries(harness_name: str) -> frozenset[str]:
+    return PRESERVED_SKILL_DIR_ENTRIES.get(harness_name, frozenset())
+
+
+def _reserved_skill_names_for_scope(scope: str) -> frozenset[str]:
+    if scope == "shared":
+        reserved: set[str] = set()
+        for entries in PRESERVED_SKILL_DIR_ENTRIES.values():
+            reserved.update(entries)
+        return frozenset(reserved)
+    return _preserved_skill_entries(scope)
+
+
 def _agy_config_paths(home: Path) -> tuple[Path, Path, Path]:
     """Return (config_dir, skills_json_path, agy_skills_dir) for the Antigravity harness."""
     spec = HARNESS_REGISTRY["agy"]
-    config_dir = home / spec.config_rel_dir
+    assert spec.skills_json_name is not None
+    config_dir = _harness_config_dir(home, spec)
     return (
         config_dir,
         config_dir / spec.skills_json_name,
@@ -203,17 +256,19 @@ def _agy_config_paths(home: Path) -> tuple[Path, Path, Path]:
 
 
 def _agy_global_agents_path(home: Path) -> Path:
-    spec = HARNESS_REGISTRY["agy"]
-    return home / spec.config_rel_dir / spec.global_agents_name
+    return _harness_global_agents_path(home, HARNESS_REGISTRY["agy"])
 
 
 def _agy_plugins_dir(home: Path) -> Path:
     spec = HARNESS_REGISTRY["agy"]
-    return home / spec.config_rel_dir / spec.plugins_dir_name
+    assert spec.plugins_dir_name is not None
+    return _harness_config_dir(home, spec) / spec.plugins_dir_name
 
 
 def _agy_config_json_path(config_dir: Path) -> Path:
-    return config_dir / HARNESS_REGISTRY["agy"].config_json_name
+    config_json_name = HARNESS_REGISTRY["agy"].config_json_name
+    assert config_json_name is not None
+    return config_dir / config_json_name
 
 
 def _validate_dir_ancestors(target_dir: Path, *, stop_at: Path | None = None) -> str | None:
@@ -378,23 +433,31 @@ def discover_skill_dirs(parent: Path) -> list[Path]:
     return [entry for entry in _iter_visible_entries(parent) if _safe_is_dir(entry)]
 
 
-def discover_agy_repo_skills(repo_root: Path) -> dict[str, Path]:
-    """Map skill names exposed to Antigravity (shared + harnesses/agy) to repo dirs."""
+def discover_harness_repo_skills(repo_root: Path, harness_name: str) -> dict[str, Path]:
+    """Map skill names exposed to harness_name (shared + harnesses/<harness>) to repo dirs."""
+    spec = HARNESS_REGISTRY[harness_name]
     skills: dict[str, Path] = {}
     for skill_dir in discover_skill_dirs(repo_root / "shared"):
         skills[skill_dir.name] = skill_dir
-    agy_spec = HARNESS_REGISTRY["agy"]
-    for skill_dir in discover_skill_dirs(repo_root / agy_spec.repo_rel_dir):
+    for skill_dir in discover_skill_dirs(repo_root / spec.repo_rel_dir):
         skills[skill_dir.name] = skill_dir
     return skills
 
 
-def _duplicate_agy_skill_names(repo_root: Path) -> set[str]:
+def _duplicate_harness_skill_names(repo_root: Path, harness_name: str) -> set[str]:
+    spec = HARNESS_REGISTRY[harness_name]
     shared_names = {p.name for p in discover_skill_dirs(repo_root / "shared")}
-    agy_names = {
-        p.name for p in discover_skill_dirs(repo_root / HARNESS_REGISTRY["agy"].repo_rel_dir)
-    }
-    return shared_names & agy_names
+    harness_names = {p.name for p in discover_skill_dirs(repo_root / spec.repo_rel_dir)}
+    return shared_names & harness_names
+
+
+def discover_agy_repo_skills(repo_root: Path) -> dict[str, Path]:
+    """Map skill names exposed to Antigravity (shared + harnesses/agy) to repo dirs."""
+    return discover_harness_repo_skills(repo_root, "agy")
+
+
+def _duplicate_agy_skill_names(repo_root: Path) -> set[str]:
+    return _duplicate_harness_skill_names(repo_root, "agy")
 
 
 def format_skills_json_path(target: Path, home: Path | None = None) -> str:
@@ -1419,6 +1482,47 @@ def _is_tilde_path(raw_path: str) -> bool:
     return raw_path == "~" or raw_path.startswith("~/")
 
 
+def _project_virtual_agents_path(
+    candidate: Path,
+    home: Path,
+    virtual_agents_target: Path,
+    *,
+    strict: bool = False,
+) -> tuple[bool, Path | None]:
+    """Resolve an absolute candidate path with ~/.agents/skills redirected virtually.
+
+    Returns (matched_virtual_link, resolved_path).
+    """
+    home_res = safe_resolve(home) or Path(os.path.abspath(str(home)))
+    agents_dir_res = safe_resolve(home / ".agents") or (home_res / ".agents")
+    virtual_link = Path(os.path.normpath(str(agents_dir_res / "skills")))
+
+    parts = candidate.parts
+    if not parts:
+        return (False, None)
+    cur = Path(parts[0])
+    for idx in range(1, len(parts)):
+        part = parts[idx]
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = cur.parent
+            continue
+        nxt = cur / part
+        if nxt == virtual_link:
+            tail = parts[idx + 1 :]
+            projected = virtual_agents_target.joinpath(*tail) if tail else virtual_agents_target
+            return (True, safe_resolve(projected, strict=strict))
+        if _safe_is_symlink(nxt):
+            resolved_nxt = safe_resolve(nxt, strict=True)
+            if resolved_nxt is None:
+                return (False, None)
+            cur = resolved_nxt
+        else:
+            cur = nxt
+    return (False, None)
+
+
 def _resolve_entry_path(
     raw_path: str, home: Path, *, virtual_agents_target: Path | None = None
 ) -> Path | None:
@@ -1434,21 +1538,11 @@ def _resolve_entry_path(
             candidate = Path(raw_path)
 
         if candidate is not None:
-            home_res = safe_resolve(home) or Path(os.path.abspath(str(home)))
-            agents_dir_res = safe_resolve(home / ".agents") or (home_res / ".agents")
-            virtual_link = Path(os.path.normpath(str(agents_dir_res / "skills")))
-            parent_res = safe_resolve(candidate.parent)
-            norm_candidate = (
-                (parent_res / candidate.name)
-                if (parent_res is not None and candidate.name)
-                else Path(os.path.normpath(str(candidate)))
+            matched, projected = _project_virtual_agents_path(
+                candidate, home, virtual_agents_target, strict=False
             )
-            if norm_candidate == virtual_link:
-                return virtual_agents_target
-            if norm_candidate.is_relative_to(virtual_link):
-                return safe_resolve(
-                    virtual_agents_target / norm_candidate.relative_to(virtual_link)
-                )
+            if matched:
+                return projected
 
     return resolve_configured_entry_path(raw_path, home)
 
@@ -2166,10 +2260,385 @@ def _preflight_shadow_container_apply(
     return (True, True)
 
 
+def _global_agents_status(agents_md_path: Path, expected_global_agents: Path | None) -> str:
+    """Return a read-only status string for a harness global instruction file."""
+    try:
+        agents_md_st = os.lstat(agents_md_path)
+    except FileNotFoundError:
+        return "not installed"
+    except OSError as exc:
+        return f"invalid (inaccessible: {exc})"
+
+    if stat.S_ISLNK(agents_md_st.st_mode):
+        resolved_md = safe_resolve(agents_md_path, strict=True)
+        raw_md_link = _safe_readlink(agents_md_path)
+        if resolved_md is None:
+            return f"conflict (broken or circular symlink -> {raw_md_link})"
+        if expected_global_agents is not None and resolved_md == expected_global_agents:
+            return f"ok (symlink -> {resolved_md})"
+        return f"conflict (symlink -> {resolved_md}, expected {expected_global_agents})"
+    if stat.S_ISREG(agents_md_st.st_mode):
+        return (
+            "conflict (regular file; run 'init.py apply --replace' to back up, "
+            "or pass '--no-global-agents' to keep)"
+        )
+    if stat.S_ISDIR(agents_md_st.st_mode):
+        return (
+            "conflict (directory; run 'init.py apply --replace' to back up, "
+            "or pass '--no-global-agents' to keep)"
+        )
+    return (
+        "conflict (non-regular file; run 'init.py apply --replace' to back up, "
+        "or pass '--no-global-agents' to keep)"
+    )
+
+
+def _is_strictly_inside(path: Path, root: Path) -> bool:
+    return path != root and path.is_relative_to(root)
+
+
+def _resolve_symlink_live_target(
+    link_path: Path,
+    *,
+    home: Path | None = None,
+    virtual_agents_target: Path | None = None,
+) -> Path | None:
+    """Resolve a symlink's live target, projecting ~/.agents/skills when virtualized."""
+    if virtual_agents_target is not None and home is not None:
+        try:
+            raw_target = os.readlink(link_path)
+        except OSError:
+            return None
+        if not raw_target or "\x00" in raw_target:
+            return None
+        parent_res = safe_resolve(link_path.parent, strict=True)
+        if parent_res is None:
+            return None
+        raw_candidate = (
+            Path(raw_target) if os.path.isabs(raw_target) else (parent_res / raw_target)
+        )
+        matched, projected = _project_virtual_agents_path(
+            raw_candidate, home, virtual_agents_target, strict=True
+        )
+        if matched:
+            return projected
+    return safe_resolve(link_path, strict=True)
+
+
+def _is_repo_owned_symlink(
+    link_path: Path,
+    repo_root: Path,
+    repo_root_res: Path,
+    *,
+    home: Path | None = None,
+    virtual_agents_target: Path | None = None,
+) -> bool:
+    """Return True if symlink link_path targets a path strictly inside the repository."""
+    try:
+        raw_target = os.readlink(link_path)
+    except OSError:
+        return False
+    if not raw_target or "\x00" in raw_target:
+        return False
+
+    parent_res = safe_resolve(link_path.parent, strict=True) or link_path.parent
+    raw_candidate = Path(raw_target) if os.path.isabs(raw_target) else (parent_res / raw_target)
+
+    if virtual_agents_target is not None and home is not None:
+        matched, projected = _project_virtual_agents_path(
+            raw_candidate, home, virtual_agents_target, strict=False
+        )
+        if matched:
+            return projected is not None and _is_strictly_inside(projected, repo_root_res)
+
+    resolved_link = safe_resolve(link_path, strict=True)
+    if resolved_link is not None:
+        return _is_strictly_inside(resolved_link, repo_root_res)
+
+    resolved = safe_resolve(raw_candidate, strict=False)
+    if resolved is not None:
+        return _is_strictly_inside(resolved, repo_root_res)
+
+    repo_abs = Path(os.path.abspath(str(repo_root)))
+    fallback = Path(os.path.abspath(str(raw_candidate)))
+    return _is_strictly_inside(fallback, repo_root_res) or _is_strictly_inside(fallback, repo_abs)
+
+
+def _status_agy_harness(
+    repo_root: Path, home: Path, expected_global_agents: Path | None
+) -> None:
+    """Print read-only Antigravity status lines."""
+    config_dir, skills_json_path, agy_skills_dir = _agy_config_paths(home)
+    agents_md_path = _agy_global_agents_path(home)
+    plugins_dir = _agy_plugins_dir(home)
+    repo_agy_skills = discover_agy_repo_skills(repo_root)
+    config_ancestor_err = _validate_dir_ancestors(config_dir, stop_at=home)
+    if config_ancestor_err is not None:
+        print(f"~/.gemini/config/skills.json ({skills_json_path}): invalid ({config_ancestor_err})")
+        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): invalid ({config_ancestor_err})")
+        print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid ({config_ancestor_err})")
+        print(f"~/.gemini/config/plugins ({plugins_dir}): invalid ({config_ancestor_err})")
+        return
+
+    try:
+        os.lstat(skills_json_path)
+    except FileNotFoundError:
+        print(f"~/.gemini/config/skills.json ({skills_json_path}): not present")
+    except OSError as exc:
+        print(f"~/.gemini/config/skills.json ({skills_json_path}): invalid (inaccessible: {exc})")
+    else:
+        resolved_target, target_err = _resolve_skills_json_target(skills_json_path)
+        if target_err is not None or resolved_target is None:
+            print(f"~/.gemini/config/skills.json ({skills_json_path}): invalid ({target_err})")
+        else:
+            data, load_err = _load_skills_json(resolved_target)
+            link_note = (
+                f" [symlink -> {resolved_target}]" if _safe_is_symlink(skills_json_path) else ""
+            )
+            if load_err is not None or data is None:
+                print(
+                    f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: "
+                    f"invalid ({load_err})"
+                )
+            else:
+                missing, target_errors = _missing_skills_json_entries(data, repo_root, home)
+                norm_plan = _plan_skills_json_normalization(
+                    data, home, canonical_targets=_desired_canonical_targets(repo_root)
+                )
+                hidden = _hidden_repo_skills(data, repo_agy_skills, home)
+                if target_errors:
+                    status_detail = f"invalid repo target ({'; '.join(target_errors)})"
+                else:
+                    issues: list[str] = []
+                    if missing:
+                        missing_labels = ", ".join(formatted for _, formatted in missing)
+                        issues.append(f"missing entries ({missing_labels})")
+                    if norm_plan.has_tilde:
+                        issues.append(
+                            "needs path normalization "
+                            "(non-absolute '~/...' entries rejected by Antigravity)"
+                        )
+                    if norm_plan.has_non_canonical_repo:
+                        issues.append(
+                            "needs path normalization (non-canonical repo alias entries)"
+                        )
+                    if norm_plan.has_duplicates:
+                        issues.append("needs deduplication (duplicate entries)")
+                    if issues:
+                        status_detail = "; ".join(issues)
+                        if hidden:
+                            status_detail += (
+                                f"; filtered out by include_only/exclude: {', '.join(hidden)}"
+                            )
+                    elif hidden:
+                        status_detail = (
+                            f"configured (filtered out by include_only/exclude: "
+                            f"{', '.join(hidden)})"
+                        )
+                    else:
+                        status_detail = "configured"
+                print(
+                    f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: {status_detail}"
+                )
+
+    md_status = _global_agents_status(agents_md_path, expected_global_agents)
+    print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): {md_status}")
+
+    if _inspect_shadow_container_status("~/.gemini/config/skills", agy_skills_dir):
+        shadowing, scan_err = _find_shadowing_agy_skills(home, repo_agy_skills)
+        if scan_err is not None:
+            print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid ({scan_err})")
+        elif shadowing:
+            names = ", ".join(entry.name for entry in shadowing)
+            print(f"~/.gemini/config/skills ({agy_skills_dir}): shadowing repo skills ({names})")
+        else:
+            print(f"~/.gemini/config/skills ({agy_skills_dir}): no shadowing collisions")
+
+    if _inspect_shadow_container_status("~/.gemini/config/plugins", plugins_dir):
+        shadowing_plugins, plugin_err = _find_shadowing_agy_plugins(home, repo_agy_skills)
+        if plugin_err is not None:
+            print(f"~/.gemini/config/plugins ({plugins_dir}): invalid ({plugin_err})")
+        elif shadowing_plugins:
+            parts: list[str] = []
+            for sp in shadowing_plugins:
+                label = f"{sp.plugin_path.name}: {', '.join(sp.colliding_skills)}"
+                blockers: list[str] = []
+                if sp.extra_unmigrated_skills:
+                    blockers.append(f"unmigrated: {', '.join(sp.extra_unmigrated_skills)}")
+                if sp.extra_runtime_components:
+                    blockers.append(
+                        f"non-skill components: {', '.join(sp.extra_runtime_components)}"
+                    )
+                if blockers:
+                    label += f" ({'; '.join(blockers)})"
+                parts.append(label)
+            print(
+                f"~/.gemini/config/plugins ({plugins_dir}): "
+                f"shadowing repo skills ({'; '.join(parts)})"
+            )
+        else:
+            print(f"~/.gemini/config/plugins ({plugins_dir}): no shadowing collisions")
+
+
+def _status_symlink_farm_harness(
+    spec: HarnessSpec,
+    repo_root: Path,
+    repo_root_res: Path,
+    home: Path,
+    expected_global_agents: Path | None,
+) -> None:
+    """Print read-only status lines for a per-skill symlink-farm harness."""
+    config_dir = _harness_config_dir(home, spec)
+    skills_dir = _harness_skills_dir(home, spec)
+    agents_md_path = _harness_global_agents_path(home, spec)
+    display_prefix = _harness_display_prefix(spec)
+    skills_label = f"{display_prefix}/{spec.skills_dir_name}"
+    agents_label = f"{display_prefix}/{spec.global_agents_name}"
+
+    config_ancestor_err = _validate_dir_ancestors(config_dir, stop_at=home)
+    if config_ancestor_err is not None:
+        print(f"{skills_label} ({skills_dir}): invalid ({config_ancestor_err})")
+        print(f"{agents_label} ({agents_md_path}): invalid ({config_ancestor_err})")
+        return
+
+    container_errs: list[str] = []
+    for rel_parts in (("shared",), Path(spec.repo_rel_dir).parts):
+        err = _validate_in_repo_container(repo_root_res, rel_parts)
+        if err is not None:
+            container_errs.append(err)
+    if not container_errs:
+        for container in (repo_root / "shared", repo_root / spec.repo_rel_dir):
+            if _safe_exists(container):
+                _, container_list_err = _iter_visible_entries_checked(container)
+                if container_list_err is not None:
+                    container_errs.append(container_list_err)
+
+    if container_errs:
+        skills_status = f"invalid repo target ({'; '.join(container_errs)})"
+    else:
+        preserved = _preserved_skill_entries(spec.name)
+        desired_map = discover_harness_repo_skills(repo_root, spec.name)
+        duplicate_names = _duplicate_harness_skill_names(repo_root, spec.name)
+        reserved_collisions = sorted(name for name in desired_map if name in preserved)
+
+        try:
+            st = os.lstat(skills_dir)
+        except FileNotFoundError:
+            issues: list[str] = []
+            if duplicate_names:
+                issues.append(f"duplicate repo skills ({', '.join(sorted(duplicate_names))})")
+            if reserved_collisions:
+                issues.append(f"reserved repo skill names ({', '.join(reserved_collisions)})")
+            missing_names = [
+                n for n in sorted(desired_map) if n not in preserved and n not in duplicate_names
+            ]
+            if missing_names:
+                issues.append(f"missing symlinks ({', '.join(missing_names)})")
+            skills_status = "; ".join(issues) if issues else "not installed"
+        except OSError as exc:
+            skills_status = f"invalid (inaccessible: {exc})"
+        else:
+            if stat.S_ISLNK(st.st_mode):
+                raw_link = _safe_readlink(skills_dir)
+                resolved = safe_resolve(skills_dir, strict=True)
+                if resolved is None:
+                    skills_status = (
+                        f"conflict (broken or circular symlink -> {raw_link}; "
+                        "run 'init.py apply --replace' to back up)"
+                    )
+                else:
+                    skills_status = (
+                        f"conflict (symlink -> {resolved}; "
+                        "run 'init.py apply --replace' to back up)"
+                    )
+            elif not stat.S_ISDIR(st.st_mode):
+                skills_status = (
+                    "conflict (non-directory file; run 'init.py apply --replace' to back up)"
+                )
+            else:
+                visible_entries, list_err = _iter_visible_entries_checked(skills_dir)
+                if list_err is not None:
+                    skills_status = f"invalid ({list_err})"
+                else:
+                    existing_stats: dict[str, tuple[Path, os.stat_result]] = {}
+                    stat_err: str | None = None
+                    for entry in visible_entries:
+                        if entry.name in preserved:
+                            continue
+                        try:
+                            existing_stats[entry.name] = (entry, os.lstat(entry))
+                        except OSError as exc:
+                            stat_err = f"inaccessible: {entry}: {exc}"
+                            break
+
+                    if stat_err is not None:
+                        skills_status = f"invalid ({stat_err})"
+                    else:
+                        ok_count = 0
+                        missing: list[str] = []
+                        conflicts: list[str] = []
+                        stale: list[str] = []
+
+                        for name, target_dir in sorted(desired_map.items()):
+                            if name in preserved or name in duplicate_names:
+                                continue
+                            target_res = safe_resolve(target_dir, strict=True)
+                            existing = existing_stats.get(name)
+                            if existing is None:
+                                missing.append(name)
+                                continue
+                            entry_path, entry_st = existing
+                            if stat.S_ISLNK(entry_st.st_mode):
+                                existing_res = safe_resolve(entry_path, strict=True)
+                                if target_res is not None and existing_res == target_res:
+                                    ok_count += 1
+                                else:
+                                    conflicts.append(name)
+                            else:
+                                conflicts.append(name)
+
+                        for name, (entry_path, entry_st) in sorted(existing_stats.items()):
+                            if name in desired_map:
+                                continue
+                            if stat.S_ISLNK(entry_st.st_mode) and _is_repo_owned_symlink(
+                                entry_path, repo_root, repo_root_res
+                            ):
+                                stale.append(name)
+
+                        issues = []
+                        if duplicate_names:
+                            issues.append(
+                                f"duplicate repo skills ({', '.join(sorted(duplicate_names))})"
+                            )
+                        if reserved_collisions:
+                            issues.append(
+                                f"reserved repo skill names ({', '.join(reserved_collisions)})"
+                            )
+                        if missing:
+                            issues.append(f"missing ({', '.join(missing)})")
+                        if conflicts:
+                            issues.append(f"conflict ({', '.join(conflicts)})")
+                        if stale:
+                            issues.append(f"stale repo symlinks ({', '.join(stale)})")
+                        skills_status = (
+                            "; ".join(issues)
+                            if issues
+                            else f"configured ({ok_count} skill symlink(s))"
+                        )
+
+    print(f"{skills_label} ({skills_dir}): {skills_status}")
+    md_status = _global_agents_status(agents_md_path, expected_global_agents)
+    print(f"{agents_label} ({agents_md_path}): {md_status}")
+
+
 def cmd_status(repo_root: Path, home: Path) -> int:
-    """Print a read-only report of repo skills, ~/.agents/skills, and Antigravity config."""
+    """Print a read-only report of repo skills, ~/.agents/skills, and harness bindings."""
     if not _safe_is_dir(repo_root):
         print(f"ERROR: repository path is not a directory: {repo_root}", file=sys.stderr)
+        return 1
+    repo_root_res = safe_resolve(repo_root, strict=True)
+    if repo_root_res is None:
+        print(f"ERROR: failed to resolve repository path: {repo_root}", file=sys.stderr)
         return 1
     home_err = _validate_dir_ancestors(home)
     if home_err is not None:
@@ -2234,149 +2703,14 @@ def cmd_status(repo_root: Path, home: Path) -> int:
                 )
     print(f"\n~/.agents/skills ({agents_skills}): {agents_status}")
 
-    config_dir, skills_json_path, agy_skills_dir = _agy_config_paths(home)
-    agents_md_path = _agy_global_agents_path(home)
-    plugins_dir = _agy_plugins_dir(home)
-    repo_agy_skills = discover_agy_repo_skills(repo_root)
-    config_ancestor_err = _validate_dir_ancestors(config_dir, stop_at=home)
-    if config_ancestor_err is not None:
-        print(f"~/.gemini/config/skills.json ({skills_json_path}): invalid ({config_ancestor_err})")
-        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): invalid ({config_ancestor_err})")
-        print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid ({config_ancestor_err})")
-        print(f"~/.gemini/config/plugins ({plugins_dir}): invalid ({config_ancestor_err})")
-        return 0
-
-    try:
-        os.lstat(skills_json_path)
-    except FileNotFoundError:
-        print(f"~/.gemini/config/skills.json ({skills_json_path}): not present")
-    except OSError as exc:
-        print(f"~/.gemini/config/skills.json ({skills_json_path}): invalid (inaccessible: {exc})")
-    else:
-        resolved_target, target_err = _resolve_skills_json_target(skills_json_path)
-        if target_err is not None or resolved_target is None:
-            print(f"~/.gemini/config/skills.json ({skills_json_path}): invalid ({target_err})")
-        else:
-            data, load_err = _load_skills_json(resolved_target)
-            link_note = (
-                f" [symlink -> {resolved_target}]" if _safe_is_symlink(skills_json_path) else ""
-            )
-            if load_err is not None or data is None:
-                print(
-                    f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: "
-                    f"invalid ({load_err})"
-                )
-            else:
-                missing, target_errors = _missing_skills_json_entries(data, repo_root, home)
-                norm_plan = _plan_skills_json_normalization(
-                    data, home, canonical_targets=_desired_canonical_targets(repo_root)
-                )
-                hidden = _hidden_repo_skills(data, repo_agy_skills, home)
-                if target_errors:
-                    status_detail = f"invalid repo target ({'; '.join(target_errors)})"
-                else:
-                    issues: list[str] = []
-                    if missing:
-                        missing_labels = ", ".join(formatted for _, formatted in missing)
-                        issues.append(f"missing entries ({missing_labels})")
-                    if norm_plan.has_tilde:
-                        issues.append(
-                            "needs path normalization "
-                            "(non-absolute '~/...' entries rejected by Antigravity)"
-                        )
-                    if norm_plan.has_non_canonical_repo:
-                        issues.append(
-                            "needs path normalization (non-canonical repo alias entries)"
-                        )
-                    if norm_plan.has_duplicates:
-                        issues.append("needs deduplication (duplicate entries)")
-                    if issues:
-                        status_detail = "; ".join(issues)
-                        if hidden:
-                            status_detail += (
-                                f"; filtered out by include_only/exclude: {', '.join(hidden)}"
-                            )
-                    elif hidden:
-                        status_detail = (
-                            f"configured (filtered out by include_only/exclude: "
-                            f"{', '.join(hidden)})"
-                        )
-                    else:
-                        status_detail = "configured"
-                print(
-                    f"~/.gemini/config/skills.json ({skills_json_path}){link_note}: {status_detail}"
-                )
-
     expected_global_agents = safe_resolve(repo_root / "global" / "AGENTS.md")
-    try:
-        agents_md_st = os.lstat(agents_md_path)
-    except FileNotFoundError:
-        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): not installed")
-    except OSError as exc:
-        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): invalid (inaccessible: {exc})")
-    else:
-        if stat.S_ISLNK(agents_md_st.st_mode):
-            resolved_md = safe_resolve(agents_md_path, strict=True)
-            raw_md_link = _safe_readlink(agents_md_path)
-            if resolved_md is None:
-                md_status = f"conflict (broken or circular symlink -> {raw_md_link})"
-            elif expected_global_agents is not None and resolved_md == expected_global_agents:
-                md_status = f"ok (symlink -> {resolved_md})"
-            else:
-                md_status = (
-                    f"conflict (symlink -> {resolved_md}, expected {expected_global_agents})"
-                )
-        elif stat.S_ISREG(agents_md_st.st_mode):
-            md_status = (
-                "conflict (regular file; run 'init.py apply --replace' to back up, "
-                "or pass '--no-global-agents' to keep)"
-            )
-        elif stat.S_ISDIR(agents_md_st.st_mode):
-            md_status = (
-                "conflict (directory; run 'init.py apply --replace' to back up, "
-                "or pass '--no-global-agents' to keep)"
-            )
+    for spec in HARNESS_REGISTRY.values():
+        if spec.install_mode == "agy_json":
+            _status_agy_harness(repo_root, home, expected_global_agents)
         else:
-            md_status = (
-                "conflict (non-regular file; run 'init.py apply --replace' to back up, "
-                "or pass '--no-global-agents' to keep)"
+            _status_symlink_farm_harness(
+                spec, repo_root, repo_root_res, home, expected_global_agents
             )
-        print(f"~/.gemini/config/AGENTS.md ({agents_md_path}): {md_status}")
-
-    if _inspect_shadow_container_status("~/.gemini/config/skills", agy_skills_dir):
-        shadowing, scan_err = _find_shadowing_agy_skills(home, repo_agy_skills)
-        if scan_err is not None:
-            print(f"~/.gemini/config/skills ({agy_skills_dir}): invalid ({scan_err})")
-        elif shadowing:
-            names = ", ".join(entry.name for entry in shadowing)
-            print(f"~/.gemini/config/skills ({agy_skills_dir}): shadowing repo skills ({names})")
-        else:
-            print(f"~/.gemini/config/skills ({agy_skills_dir}): no shadowing collisions")
-
-    if _inspect_shadow_container_status("~/.gemini/config/plugins", plugins_dir):
-        shadowing_plugins, plugin_err = _find_shadowing_agy_plugins(home, repo_agy_skills)
-        if plugin_err is not None:
-            print(f"~/.gemini/config/plugins ({plugins_dir}): invalid ({plugin_err})")
-        elif shadowing_plugins:
-            parts: list[str] = []
-            for sp in shadowing_plugins:
-                label = f"{sp.plugin_path.name}: {', '.join(sp.colliding_skills)}"
-                blockers: list[str] = []
-                if sp.extra_unmigrated_skills:
-                    blockers.append(f"unmigrated: {', '.join(sp.extra_unmigrated_skills)}")
-                if sp.extra_runtime_components:
-                    blockers.append(
-                        f"non-skill components: {', '.join(sp.extra_runtime_components)}"
-                    )
-                if blockers:
-                    label += f" ({'; '.join(blockers)})"
-                parts.append(label)
-            print(
-                f"~/.gemini/config/plugins ({plugins_dir}): "
-                f"shadowing repo skills ({'; '.join(parts)})"
-            )
-        else:
-            print(f"~/.gemini/config/plugins ({plugins_dir}): no shadowing collisions")
 
     return 0
 
@@ -2661,8 +2995,45 @@ def _apply_agy_skills_json(
     return (True, data)
 
 
-def _apply_agy_global_agents(
-    repo_root: Path,
+def _resolve_repo_global_agents(repo_root: Path, repo_root_res: Path) -> Path | None:
+    """Validate and resolve <repo>/global/AGENTS.md as a regular non-symlink file."""
+    global_container_err = _validate_in_repo_container(repo_root_res, ("global",))
+    if global_container_err is not None:
+        print(f"ERROR: {global_container_err}", file=sys.stderr)
+        return None
+
+    global_agents = repo_root / "global" / "AGENTS.md"
+    try:
+        global_st = os.lstat(global_agents)
+    except FileNotFoundError:
+        print(f"ERROR: repository global/AGENTS.md not found: {global_agents}", file=sys.stderr)
+        return None
+    except OSError as exc:
+        print(f"ERROR: cannot inspect {global_agents}: {exc}", file=sys.stderr)
+        return None
+    if stat.S_ISLNK(global_st.st_mode):
+        print(
+            f"ERROR: repository global/AGENTS.md must not be a symlink: {global_agents}",
+            file=sys.stderr,
+        )
+        return None
+    if not stat.S_ISREG(global_st.st_mode):
+        print(
+            f"ERROR: repository global/AGENTS.md must be a regular file: {global_agents}",
+            file=sys.stderr,
+        )
+        return None
+
+    global_agents_res = safe_resolve(global_agents, strict=True)
+    if global_agents_res is None:
+        print(f"ERROR: failed to resolve {global_agents}", file=sys.stderr)
+        return None
+    return global_agents_res
+
+
+def _apply_harness_global_agents(
+    spec: HarnessSpec,
+    global_agents_res: Path | None,
     repo_root_res: Path,
     home: Path,
     timestamp: str,
@@ -2671,45 +3042,15 @@ def _apply_agy_global_agents(
     replace: bool,
     no_global_agents: bool,
 ) -> bool:
-    """Link ~/.gemini/config/AGENTS.md -> <repo>/global/AGENTS.md unless opted out."""
-    agents_md_path = _agy_global_agents_path(home)
+    """Link a harness global instruction file -> <repo>/global/AGENTS.md unless opted out."""
+    config_dir = _harness_config_dir(home, spec)
+    agents_md_path = _harness_global_agents_path(home, spec)
     if no_global_agents:
         print(f"Skipped {agents_md_path} (--no-global-agents)")
         return True
-
-    global_container_err = _validate_in_repo_container(repo_root_res, ("global",))
-    if global_container_err is not None:
-        print(f"ERROR: {global_container_err}", file=sys.stderr)
-        return False
-
-    global_agents = repo_root / "global" / "AGENTS.md"
-    try:
-        global_st = os.lstat(global_agents)
-    except FileNotFoundError:
-        print(f"ERROR: repository global/AGENTS.md not found: {global_agents}", file=sys.stderr)
-        return False
-    except OSError as exc:
-        print(f"ERROR: cannot inspect {global_agents}: {exc}", file=sys.stderr)
-        return False
-    if stat.S_ISLNK(global_st.st_mode):
-        print(
-            f"ERROR: repository global/AGENTS.md must not be a symlink: {global_agents}",
-            file=sys.stderr,
-        )
-        return False
-    if not stat.S_ISREG(global_st.st_mode):
-        print(
-            f"ERROR: repository global/AGENTS.md must be a regular file: {global_agents}",
-            file=sys.stderr,
-        )
-        return False
-
-    global_agents_res = safe_resolve(global_agents, strict=True)
     if global_agents_res is None:
-        print(f"ERROR: failed to resolve {global_agents}", file=sys.stderr)
         return False
 
-    config_dir, _, _ = _agy_config_paths(home)
     ancestor_err = _validate_dir_ancestors(config_dir, stop_at=home)
     if ancestor_err is not None:
         print(f"ERROR: cannot link {agents_md_path} ({ancestor_err}).", file=sys.stderr)
@@ -3123,6 +3464,412 @@ def _apply_agy_plugin_shadow_backups(
     return ok
 
 
+def _backup_and_create_dir(
+    target_dir: Path,
+    backup_parent: Path,
+    backup_stem: str,
+    timestamp: str,
+) -> bool:
+    """Atomically back up a non-directory entry at target_dir and create a real directory."""
+    try:
+        backup_path = _create_unique_backup_file_slot(backup_parent, backup_stem, timestamp)
+    except OSError as exc:
+        print(
+            f"ERROR: failed to reserve backup slot in {backup_parent}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        os.rename(target_dir, backup_path)
+    except OSError as exc:
+        with contextlib.suppress(OSError):
+            backup_path.unlink()
+        print(
+            f"ERROR: failed to back up {target_dir} -> {backup_path}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+
+    try:
+        target_dir.mkdir(parents=False, exist_ok=False)
+    except BaseException as exc:
+        if not _path_exists_or_symlink(target_dir):
+            try:
+                os.rename(backup_path, target_dir)
+            except OSError as rb_exc:
+                print(
+                    f"ERROR: rollback failed ({backup_path} -> {target_dir}): {rb_exc}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"ERROR: rollback skipped because {target_dir} reappeared; "
+                f"original backup preserved at {backup_path}",
+                file=sys.stderr,
+            )
+        if isinstance(exc, OSError):
+            print(
+                f"ERROR: failed to create directory {target_dir}: {exc}",
+                file=sys.stderr,
+            )
+            return False
+        raise
+
+    print(f"Backed up {target_dir} -> {backup_path}")
+    print(f"Created {target_dir}")
+    return True
+
+
+def _apply_symlink_farm_harness(
+    spec: HarnessSpec,
+    repo_root: Path,
+    repo_root_res: Path,
+    home: Path,
+    timestamp: str,
+    *,
+    dry_run: bool,
+    replace: bool,
+    virtual_agents_target: Path | None = None,
+) -> bool:
+    """Maintain per-skill symlinks inside ~/.<harness>/skills/ without disturbing built-ins."""
+    harness_container_err = _validate_in_repo_container(
+        repo_root_res, Path(spec.repo_rel_dir).parts
+    )
+    if harness_container_err is not None:
+        print(f"ERROR: {harness_container_err}", file=sys.stderr)
+        return False
+
+    for container in (repo_root / "shared", repo_root / spec.repo_rel_dir):
+        if _safe_exists(container):
+            _, container_list_err = _iter_visible_entries_checked(container)
+            if container_list_err is not None:
+                print(f"ERROR: {container_list_err}", file=sys.stderr)
+                return False
+
+    config_dir = _harness_config_dir(home, spec)
+    skills_dir = _harness_skills_dir(home, spec)
+    ancestor_err = _validate_dir_ancestors(config_dir, stop_at=home)
+    if ancestor_err is not None:
+        print(f"ERROR: cannot configure {skills_dir} ({ancestor_err}).", file=sys.stderr)
+        return False
+
+    config_dir_res = safe_resolve(config_dir, strict=False)
+    if config_dir_res is not None and (
+        config_dir_res == repo_root_res or config_dir_res.is_relative_to(repo_root_res)
+    ):
+        print(
+            f"ERROR: refusing to modify {skills_dir} because {config_dir} resolves inside "
+            f"repository {repo_root_res}.",
+            file=sys.stderr,
+        )
+        return False
+
+    desired_map = discover_harness_repo_skills(repo_root, spec.name)
+    duplicate_names = _duplicate_harness_skill_names(repo_root, spec.name)
+    preserved = _preserved_skill_entries(spec.name)
+
+    valid_targets: dict[str, Path] = {}
+    repo_skill_errors: list[str] = []
+    for dup in sorted(duplicate_names):
+        repo_skill_errors.append(
+            f"refusing to link '{dup}' for harness '{spec.name}' because it is "
+            f"duplicated in both shared/ and {spec.repo_rel_dir}/."
+        )
+    for name, target_dir in sorted(desired_map.items()):
+        if name in duplicate_names:
+            continue
+        if name in preserved:
+            repo_skill_errors.append(
+                f"refusing to link skill '{name}' for harness '{spec.name}' "
+                f"because '{name}' is a reserved harness entry."
+            )
+            continue
+        validation_errors = validate_skill_dir(target_dir) + _validate_skill_tree_symlinks(
+            target_dir, repo_root, repo_root_res
+        )
+        if validation_errors:
+            repo_skill_errors.append(
+                f"refusing to link {target_dir} for harness '{spec.name}' "
+                f"(failed validation: {'; '.join(validation_errors)})."
+            )
+            continue
+        target_res = safe_resolve(target_dir, strict=True)
+        if target_res is None:
+            repo_skill_errors.append(f"failed to resolve repo skill {target_dir}.")
+            continue
+        valid_targets[name] = target_res
+
+    skills_dir_exists = False
+    replacing_container = False
+    replaced_container = False
+    try:
+        st = os.lstat(skills_dir)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"ERROR: cannot inspect {skills_dir}: {exc}", file=sys.stderr)
+        return False
+    else:
+        is_link = stat.S_ISLNK(st.st_mode)
+        if not is_link and stat.S_ISDIR(st.st_mode):
+            skills_dir_res = safe_resolve(skills_dir, strict=True)
+            if skills_dir_res is None or _paths_overlap(skills_dir_res, repo_root_res):
+                print(
+                    f"ERROR: refusing to modify {skills_dir} because it overlaps "
+                    f"repository {repo_root_res}.",
+                    file=sys.stderr,
+                )
+                return False
+            skills_dir_exists = True
+        else:
+            kind = "symlink" if is_link else "file"
+            if not replace:
+                print(
+                    f"CONFLICT: {skills_dir} already exists as a {kind}; leaving untouched "
+                    "(re-run with --replace to back up and create skills directory).",
+                    file=sys.stderr,
+                )
+                return False
+            if not is_link and _safe_exists(skills_dir):
+                existing_res = safe_resolve(skills_dir, strict=True)
+                if existing_res is None or _paths_overlap(existing_res, repo_root_res):
+                    print(
+                        f"ERROR: refusing to back up {skills_dir} because it overlaps "
+                        f"repository {repo_root_res}.",
+                        file=sys.stderr,
+                    )
+                    return False
+            if repo_skill_errors:
+                for err in repo_skill_errors:
+                    print(f"ERROR: {err}", file=sys.stderr)
+                print(
+                    f"ERROR: refusing to replace {skills_dir} because one or more repository "
+                    f"skills for harness '{spec.name}' failed validation.",
+                    file=sys.stderr,
+                )
+                return False
+            if dry_run:
+                preview_backup = unique_backup_path(config_dir, spec.skills_dir_name, timestamp)
+                print(
+                    f"[dry-run] Would move {skills_dir} -> {preview_backup} "
+                    f"and create {skills_dir}"
+                )
+                replacing_container = True
+                replaced_container = True
+            else:
+                if not _backup_and_create_dir(
+                    skills_dir, config_dir, spec.skills_dir_name, timestamp
+                ):
+                    return False
+                skills_dir_exists = True
+                replaced_container = True
+
+    ok = not repo_skill_errors
+    for err in repo_skill_errors:
+        print(f"ERROR: {err}", file=sys.stderr)
+
+    pruned_count = 0
+    if skills_dir_exists:
+        existing_entries, list_err = _iter_visible_entries_checked(skills_dir)
+        if list_err is not None:
+            print(f"ERROR: {list_err}", file=sys.stderr)
+            return False
+        for entry in existing_entries:
+            if entry.name in preserved or entry.name in desired_map:
+                continue
+            try:
+                entry_st = os.lstat(entry)
+            except OSError as exc:
+                print(f"ERROR: cannot inspect {entry}: {exc}", file=sys.stderr)
+                ok = False
+                continue
+            if not stat.S_ISLNK(entry_st.st_mode):
+                continue
+            if _is_repo_owned_symlink(
+                entry,
+                repo_root,
+                repo_root_res,
+                home=home,
+                virtual_agents_target=virtual_agents_target,
+            ):
+                if dry_run:
+                    print(f"[dry-run] Would remove stale symlink {entry}")
+                    pruned_count += 1
+                else:
+                    try:
+                        entry.unlink()
+                    except OSError as exc:
+                        print(
+                            f"ERROR: failed to remove stale symlink {entry}: {exc}",
+                            file=sys.stderr,
+                        )
+                        ok = False
+                    else:
+                        print(f"Removed stale symlink {entry}")
+                        pruned_count += 1
+
+    already_ok = 0
+    linked_count = 0
+    backup_dir: Path | None = None
+    moved_count = 0
+
+    try:
+        for name, target_res in valid_targets.items():
+            link_path = skills_dir / name
+            if replacing_container:
+                is_link = False
+                exists = False
+                is_real_dir = False
+            else:
+                try:
+                    link_st = os.lstat(link_path)
+                except FileNotFoundError:
+                    is_link = False
+                    exists = False
+                    is_real_dir = False
+                except OSError as exc:
+                    print(f"ERROR: cannot inspect {link_path}: {exc}", file=sys.stderr)
+                    ok = False
+                    continue
+                else:
+                    is_link = stat.S_ISLNK(link_st.st_mode)
+                    exists = _safe_exists(link_path)
+                    is_real_dir = (not is_link) and stat.S_ISDIR(link_st.st_mode)
+
+            if not is_link and not exists:
+                if dry_run:
+                    print(f"[dry-run] Would symlink {link_path} -> {target_res}")
+                    linked_count += 1
+                    continue
+                try:
+                    skills_dir.mkdir(parents=True, exist_ok=True)
+                    link_path.symlink_to(target_res)
+                except OSError as exc:
+                    print(
+                        f"ERROR: failed to symlink {link_path} -> {target_res}: {exc}",
+                        file=sys.stderr,
+                    )
+                    ok = False
+                    continue
+                print(f"Linked {link_path} -> {target_res}")
+                linked_count += 1
+                continue
+
+            if is_link:
+                live_target = _resolve_symlink_live_target(
+                    link_path,
+                    home=home,
+                    virtual_agents_target=virtual_agents_target,
+                )
+                if live_target == target_res:
+                    already_ok += 1
+                    continue
+
+            if not replace:
+                kind = "symlink" if is_link else ("directory" if is_real_dir else "file")
+                print(
+                    f"CONFLICT: {link_path} already exists as a {kind}; leaving untouched "
+                    "(re-run with --replace to back up and link).",
+                    file=sys.stderr,
+                )
+                ok = False
+                continue
+
+            if not is_link and exists:
+                existing_res = safe_resolve(link_path, strict=True)
+                if (
+                    existing_res is None
+                    or _paths_overlap(existing_res, repo_root_res)
+                    or _paths_overlap(existing_res, target_res)
+                ):
+                    print(
+                        f"ERROR: refusing to back up {link_path} because it overlaps "
+                        f"repository {repo_root_res}.",
+                        file=sys.stderr,
+                    )
+                    ok = False
+                    continue
+
+            if backup_dir is None:
+                if dry_run:
+                    backup_dir = unique_backup_path(config_dir, spec.skills_dir_name, timestamp)
+                else:
+                    try:
+                        backup_dir = _create_unique_backup_dir(
+                            config_dir, spec.skills_dir_name, timestamp
+                        )
+                    except OSError as exc:
+                        print(
+                            f"ERROR: failed to create backup directory in {config_dir}: {exc}",
+                            file=sys.stderr,
+                        )
+                        return False
+
+            dest = backup_dir / name
+            if dry_run:
+                print(
+                    f"[dry-run] Would move {link_path} -> {dest} "
+                    f"and symlink {link_path} -> {target_res}"
+                )
+                linked_count += 1
+                continue
+
+            try:
+                _move_entry_to_backup(link_path, dest, backup_dir)
+            except OSError as exc:
+                print(
+                    f"ERROR: failed to back up {link_path} -> {dest}: {exc}",
+                    file=sys.stderr,
+                )
+                ok = False
+                continue
+
+            try:
+                link_path.symlink_to(target_res)
+            except BaseException as exc:
+                if not _path_exists_or_symlink(link_path):
+                    try:
+                        _move_entry_to_backup(dest, link_path, skills_dir)
+                    except OSError as rb_exc:
+                        moved_count += 1
+                        print(
+                            f"ERROR: rollback failed ({dest} -> {link_path}): {rb_exc}",
+                            file=sys.stderr,
+                        )
+                else:
+                    moved_count += 1
+                    print(
+                        f"ERROR: rollback skipped because {link_path} reappeared; "
+                        f"original backup preserved at {dest}",
+                        file=sys.stderr,
+                    )
+                if isinstance(exc, OSError):
+                    print(
+                        f"ERROR: failed to symlink {link_path} -> {target_res}: {exc}",
+                        file=sys.stderr,
+                    )
+                    ok = False
+                    continue
+                raise
+
+            moved_count += 1
+            linked_count += 1
+            print(f"Backed up {link_path} -> {dest}")
+            print(f"Linked {link_path} -> {target_res}")
+    finally:
+        if backup_dir is not None and not dry_run and moved_count == 0:
+            with contextlib.suppress(OSError):
+                backup_dir.rmdir()
+
+    if ok and linked_count == 0 and pruned_count == 0 and not replaced_container:
+        print(f"OK: {skills_dir} already links all {already_ok} skill(s)")
+    elif already_ok > 0:
+        print(f"OK: {skills_dir} kept {already_ok} existing skill symlink(s)")
+
+    return ok
+
+
 def cmd_apply(
     repo_root: Path,
     home: Path,
@@ -3131,7 +3878,7 @@ def cmd_apply(
     replace: bool,
     no_global_agents: bool = False,
 ) -> int:
-    """Link ~/.agents/skills -> shared/, link global AGENTS.md, and configure skills.json."""
+    """Link ~/.agents/skills -> shared/, configure harnesses, and link global rules."""
     home_err = _validate_dir_ancestors(home)
     if home_err is not None:
         print(f"ERROR: invalid home path ({home_err})", file=sys.stderr)
@@ -3162,53 +3909,85 @@ def cmd_apply(
         repo_root_res, shared_res, home, timestamp, dry_run=dry_run, replace=replace
     )
     virtual_agents_target = shared_res if (dry_run and agents_ok) else None
-    skills_json_ready, skills_json_data = _apply_agy_skills_json(
-        repo_root,
-        repo_root_res,
-        home,
-        dry_run=dry_run,
-        virtual_agents_target=virtual_agents_target,
-    )
-    global_agents_ok = _apply_agy_global_agents(
-        repo_root,
-        repo_root_res,
-        home,
-        timestamp,
-        dry_run=dry_run,
-        replace=replace,
-        no_global_agents=no_global_agents,
-    )
-    shadows_ok = _apply_agy_shadow_backups(
-        repo_root,
-        repo_root_res,
-        home,
-        timestamp,
-        skills_json_ready=skills_json_ready,
-        skills_json_data=skills_json_data,
-        dry_run=dry_run,
-        replace=replace,
-    )
-    plugin_shadows_ok = _apply_agy_plugin_shadow_backups(
-        repo_root,
-        repo_root_res,
-        home,
-        timestamp,
-        skills_json_ready=skills_json_ready,
-        skills_json_data=skills_json_data,
-        dry_run=dry_run,
-        replace=replace,
-    )
-    return (
-        0
-        if (
-            agents_ok
-            and skills_json_ready
-            and global_agents_ok
-            and shadows_ok
-            and plugin_shadows_ok
-        )
-        else 1
-    )
+
+    if no_global_agents:
+        global_agents_res: Path | None = None
+        global_agents_resolved_ok = True
+    else:
+        global_agents_res = _resolve_repo_global_agents(repo_root, repo_root_res)
+        global_agents_resolved_ok = global_agents_res is not None
+
+    all_ok = agents_ok and global_agents_resolved_ok
+    for spec in HARNESS_REGISTRY.values():
+        if spec.install_mode == "agy_json":
+            skills_json_ready, skills_json_data = _apply_agy_skills_json(
+                repo_root,
+                repo_root_res,
+                home,
+                dry_run=dry_run,
+                virtual_agents_target=virtual_agents_target,
+            )
+            harness_global_ok = _apply_harness_global_agents(
+                spec,
+                global_agents_res,
+                repo_root_res,
+                home,
+                timestamp,
+                dry_run=dry_run,
+                replace=replace,
+                no_global_agents=no_global_agents,
+            )
+            shadows_ok = _apply_agy_shadow_backups(
+                repo_root,
+                repo_root_res,
+                home,
+                timestamp,
+                skills_json_ready=skills_json_ready,
+                skills_json_data=skills_json_data,
+                dry_run=dry_run,
+                replace=replace,
+            )
+            plugin_shadows_ok = _apply_agy_plugin_shadow_backups(
+                repo_root,
+                repo_root_res,
+                home,
+                timestamp,
+                skills_json_ready=skills_json_ready,
+                skills_json_data=skills_json_data,
+                dry_run=dry_run,
+                replace=replace,
+            )
+            all_ok = (
+                all_ok
+                and skills_json_ready
+                and harness_global_ok
+                and shadows_ok
+                and plugin_shadows_ok
+            )
+        else:
+            farm_ok = _apply_symlink_farm_harness(
+                spec,
+                repo_root,
+                repo_root_res,
+                home,
+                timestamp,
+                dry_run=dry_run,
+                replace=replace,
+                virtual_agents_target=virtual_agents_target,
+            )
+            harness_global_ok = _apply_harness_global_agents(
+                spec,
+                global_agents_res,
+                repo_root_res,
+                home,
+                timestamp,
+                dry_run=dry_run,
+                replace=replace,
+                no_global_agents=no_global_agents,
+            )
+            all_ok = all_ok and farm_ok and harness_global_ok
+
+    return 0 if all_ok else 1
 
 
 def _find_cross_scope_duplicate(repo_root: Path, scope: str, name: str) -> Path | None:
@@ -3265,6 +4044,13 @@ def cmd_adopt(repo_root: Path, source_dir: Path | str, *, scope: str, force: boo
         dest_parent = repo_root / HARNESS_REGISTRY[scope].repo_rel_dir
     else:
         print(f"ERROR: unsupported adopt scope: {scope}", file=sys.stderr)
+        return 1
+
+    if name in _reserved_skill_names_for_scope(scope):
+        print(
+            f"ERROR: skill name '{name}' is reserved for scope '{scope}'",
+            file=sys.stderr,
+        )
         return 1
 
     container_err = _validate_in_repo_container(repo_root_res, dest_rel_parts)
@@ -3969,6 +4755,10 @@ def cmd_doctor(repo_root: Path) -> int:
     shared_names, shared_errs = _check_skill_container(repo_root / "shared", repo_root)
     total_skills = len(shared_names)
     errors.extend(shared_errs)
+    for reserved in sorted(shared_names & _reserved_skill_names_for_scope("shared")):
+        errors.append(
+            f"shared/{reserved}: skill name {reserved!r} is reserved by a harness skill directory"
+        )
 
     harnesses_root = repo_root / "harnesses"
     if _safe_is_symlink(harnesses_root):
@@ -3989,6 +4779,13 @@ def cmd_doctor(repo_root: Path) -> int:
             errors.extend(harness_errs)
             for dup in sorted(shared_names & harness_names):
                 errors.append(f"{rel}/{dup}: duplicate skill name also exists in shared/{dup}")
+            for reserved in sorted(
+                harness_names & _reserved_skill_names_for_scope(harness_dir.name)
+            ):
+                errors.append(
+                    f"{rel}/{reserved}: skill name {reserved!r} is reserved by "
+                    f"harness '{harness_dir.name}'"
+                )
 
     # Symlink confinement & integrity check
     symlink_count = 0
@@ -4070,7 +4867,7 @@ def cmd_doctor(repo_root: Path) -> int:
                 if link_err is not None or resolved is None:
                     errors.append(f"{rel}:{lineno}: invalid relative markdown link: {link_err}")
 
-    # Hardcoded machine user path scan across .md, .py, .json files
+    # Hardcoded machine user path scan across .md, .py, .json, .toml files
     scanned_path_files = 0
     for entry in entries:
         if _safe_is_symlink(entry) or not _safe_is_file(entry):
@@ -4157,8 +4954,8 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser = subparsers.add_parser(
         "apply",
         help=(
-            "Link ~/.agents/skills -> shared/, link global AGENTS.md, "
-            "and merge Antigravity skills.json."
+            "Link ~/.agents/skills -> shared/, configure agy/claude/codex skills, "
+            "and link global rules."
         ),
     )
     _add_repo_arg(apply_parser)
@@ -4171,7 +4968,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--replace",
         action="store_true",
         help=(
-            "Back up conflicting ~/.agents/skills, ~/.gemini/config/AGENTS.md, "
+            "Back up conflicting ~/.agents/skills, global rule files, "
             "and colliding skills/plugins entries."
         ),
     )
@@ -4180,7 +4977,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-global-agents",
         dest="no_global_agents",
         action="store_true",
-        help="Do not install or overwrite ~/.gemini/config/AGENTS.md.",
+        help=(
+            "Do not install or overwrite ~/.gemini/config/AGENTS.md, "
+            "~/.claude/CLAUDE.md, or ~/.codex/AGENTS.md."
+        ),
     )
     apply_parser.add_argument(
         "--home",

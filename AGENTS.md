@@ -13,7 +13,7 @@ Every skill, helper script, and CLI tool in this repository **must** follow thes
    - *Why*: Eliminates macOS BSD vs. Linux GNU tool divergences (`sed`, `grep`, `find`, `mktemp`, `readlink`), enables clean `argparse` flags and structured error handling, and makes every helper directly unit-testable under `pytest`.
    - Keep `init.py` and `core/*/scripts/*.py` orchestration helpers **100% stdlib-only** so a freshly cloned machine never needs a virtualenv or `pip install` just to run skills or `init.py` (`pytest` and `ruff` may be configured in `pyproject.toml` for development/testing). Upstream domain or vendor benchmark scripts bundled inside `shared/<skill>/scripts/` (such as MuJoCo flex benchmarks) may import their domain packages.
 2. **Zero Machine-Specific Hardcoded Paths**:
-   - **Never** hardcode `/Users/<username>` or `/home/<username>` in any tracked `.md`, `.py`, or `.json` file.
+   - **Never** hardcode `/Users/<username>` or `/home/<username>` in any tracked `.md`, `.py`, `.json`, or `.toml` file.
    - Use `$HOME` in shell command examples, `Path.home()` in Python, and relative `./core/...`, `./references/...`, or `./scripts/...` links inside skill directories.
    - Note that while tracked repository files never hardcode user home paths, `init.py apply` writes dynamically resolved **absolute `/...` POSIX paths** into machine-local `~/.gemini/config/skills.json` because Antigravity's Go loader (`customization.go:617`) rejects `~` / `~/...` entries in global `skills.json`.
    - When a coordinator/parent skill needs to give a spawned worker an absolute path to a playbook or helper script, instruct it to resolve `<SKILL_DIR>` dynamically from the directory of the `SKILL.md` file it just loaded.
@@ -36,7 +36,7 @@ agent-skills/
 ├── pyproject.toml                     # Python 3.11+, pytest & ruff config (stdlib-only runtime)
 ├── init.py                            # Multi-machine installer, status checker, adopter & linter
 ├── global/
-│   └── AGENTS.md                      # Portable global rules linked to ~/.gemini/config/AGENTS.md
+│   └── AGENTS.md                      # Portable global rules linked to ~/.gemini/config/AGENTS.md, ~/.claude/CLAUDE.md, and ~/.codex/AGENTS.md
 ├── tests/                             # pytest suite for init.py, doctor, and core helper scripts
 ├── core/                              # Harness- & model-agnostic workflows, personas, playbooks & scripts
 │   ├── dev-swarm/
@@ -65,19 +65,40 @@ agent-skills/
 │   │   └── .managed-by-hey-cli
 │   └── mujoco-deformables/            # MuJoCo 1D/2D/3D deformable flex modeling skill
 └── harnesses/                         # Thin harness-specific SKILL.md adapters
-    └── agy/                           # Antigravity (active harness; structured for future harnesses)
+    ├── agy/                           # Antigravity (skills.json + ~/.gemini/config/AGENTS.md)
+    │   ├── dev-swarm/
+    │   │   ├── SKILL.md               # AGY model pins + native `swarm` board bindings -> ./core/...
+    │   │   └── core -> ../../../core/dev-swarm
+    │   ├── dev-swarm-zircon/
+    │   │   ├── SKILL.md               # AGY bindings -> ./core/...
+    │   │   └── core -> ../../../core/dev-swarm-zircon
+    │   └── review/
+    │       ├── SKILL.md               # AGY standalone vs embedded swarm-worker bindings -> ./core/...
+    │       └── core -> ../../../core/review
+    ├── claude/                        # Claude Code (~/.claude/skills/* symlinks + ~/.claude/CLAUDE.md)
+    │   ├── dev-swarm/
+    │   │   ├── SKILL.md               # Claude model pins + Agent subagent bindings -> ./core/...
+    │   │   └── core -> ../../../core/dev-swarm
+    │   ├── dev-swarm-zircon/
+    │   │   ├── SKILL.md               # Claude Zircon porting bindings -> ./core/...
+    │   │   └── core -> ../../../core/dev-swarm-zircon
+    │   └── review/
+    │       ├── SKILL.md               # Claude subagent review bindings -> ./core/...
+    │       └── core -> ../../../core/review
+    └── codex/                         # Codex (~/.codex/skills/* symlinks + ~/.codex/AGENTS.md)
+        ├── claude-review/             # Codex-only cross-model Claude review wrapper skill
         ├── dev-swarm/
-        │   ├── SKILL.md               # AGY model pins + native `swarm` board bindings -> ./core/...
+        │   ├── SKILL.md               # Codex model pins + subagent bindings -> ./core/...
         │   └── core -> ../../../core/dev-swarm
         ├── dev-swarm-zircon/
-        │   ├── SKILL.md               # AGY bindings -> ./core/...
+        │   ├── SKILL.md               # Codex Zircon porting bindings -> ./core/...
         │   └── core -> ../../../core/dev-swarm-zircon
         └── review/
-            ├── SKILL.md               # AGY standalone vs embedded swarm-worker bindings -> ./core/...
+            ├── SKILL.md               # Codex subagent review bindings -> ./core/...
             └── core -> ../../../core/review
 ```
 
-*(Claude Code and Codex adapters are intentionally unpopulated for now—only Antigravity (`agy`) + universal `~/.agents/skills` (`shared/`) are active, while `init.py`'s harness registry stays modular so adding another harness later is trivial.)*
+All three harnesses (`agy`, `claude`, `codex`) plus universal `~/.agents/skills` (`shared/`) are active and managed through `init.py`'s `HARNESS_REGISTRY`.
 
 ---
 
@@ -101,7 +122,7 @@ Files under `core/` must **not** hardcode Antigravity-specific tool or model nam
 `init.py` is an executable Python 3.11+ stdlib CLI supporting `--home <DIR>` (defaulting to `Path.home()`) on all stateful subcommands so tests never touch the real `$HOME`:
 
 - **`python3 init.py status [--home DIR]`**:
-  - Read-only report showing the state of `~/.agents/skills` (including unmigrated or differing local skills when it is a real directory), `~/.gemini/config/skills.json` (including non-absolute `~/...` normalization checks), `~/.gemini/config/AGENTS.md`, any shadowing same-named directories in `~/.gemini/config/skills/`, any shadowing non-marketplace local plugins in `~/.gemini/config/plugins/`, and all skills discovered in this repo.
+  - Read-only report showing the state of `~/.agents/skills` (including unmigrated or differing local skills when it is a real directory), Antigravity (`~/.gemini/config/skills.json` with non-absolute `~/...` normalization checks, `~/.gemini/config/AGENTS.md`, any shadowing same-named directories in `~/.gemini/config/skills/`, and any shadowing non-marketplace local plugins in `~/.gemini/config/plugins/`), Claude Code (`~/.claude/skills/` per-skill symlink farm and `~/.claude/CLAUDE.md`), Codex (`~/.codex/skills/` per-skill symlink farm and `~/.codex/AGENTS.md`), and all skills discovered in this repo.
 - **`python3 init.py apply [--dry-run] [--replace] [--no-global-agents | --skip-global-agents] [--home DIR]`**:
   1. **`~/.agents/skills` -> `<repo>/shared` symlink**: Creates `~/.agents` if needed and points `~/.agents/skills` at `<repo>/shared` (so `npx skills add ...` installs universal skills straight into `shared/`). If `~/.agents/skills` already exists as a real non-symlink directory:
      - Without `--replace`: report the conflict clearly and do **not** delete or overwrite it.
@@ -110,20 +131,25 @@ Files under `core/` must **not** hardcode Antigravity-specific tool or model nam
      - Parses existing `~/.gemini/config/skills.json` if present (preserving `inherits`, filter fields, and unrelated `entries`).
      - Writes dynamically resolved **absolute `/...` POSIX paths** (`<repo>/shared` and `<repo>/harnesses/agy`) because Antigravity's Go loader (`customization.go:617`) rejects `~` / `~/...` entries in global `skills.json`.
      - Normalizes any legacy `~` / `~/...` entry paths to their resolved absolute POSIX paths and deduplicates colliding entries with identical filter/metadata keys while preserving order, written atomically via temp file + `os.replace`.
-  3. **Antigravity `~/.gemini/config/AGENTS.md` -> `<repo>/global/AGENTS.md` symlink**:
-     - Unless `--no-global-agents` (alias `--skip-global-agents`) is passed, links `~/.gemini/config/AGENTS.md` to `<repo>/global/AGENTS.md` (backing up an existing conflict to `~/.gemini/config/AGENTS.md.bak.<timestamp>` under `--replace`).
-     - When `--no-global-agents` / `--skip-global-agents` is passed, leaves `~/.gemini/config/AGENTS.md` completely untouched even under `--replace`.
-  4. **Shadowing detection & backup (`~/.gemini/config/skills/` and `~/.gemini/config/plugins/`)**:
+  3. **Claude Code & Codex per-skill symlink farms (`~/.claude/skills/*` and `~/.codex/skills/*`)**:
+     - Exposes both `shared/<name>` and `harnesses/<harness>/<name>` side-by-side via per-skill symlinks inside `~/.claude/skills/<name>` and `~/.codex/skills/<name>` (refusing duplicate or invalid skills without disturbing existing user entries).
+     - Preserves hidden entries (such as Codex's `.system/`), Claude Code's `synced/` directory, and unrelated user skills or external symlinks untouched.
+     - Prunes stale repo-owned symlinks pointing inside `<repo>` that are no longer desired for that harness.
+     - Reports `CONFLICT` without `--replace` if a desired skill path (or `~/.<harness>/skills` itself) already exists; with `--replace`, backs up conflicting entries into `~/.<harness>/skills.bak.<timestamp>/` (or backs up a conflicting container file/symlink) before creating symlinks.
+  4. **Global instruction links (`~/.gemini/config/AGENTS.md`, `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md` -> `<repo>/global/AGENTS.md`)**:
+     - Unless `--no-global-agents` (alias `--skip-global-agents`) is passed, links all three global instruction files to `<repo>/global/AGENTS.md` (backing up an existing conflict to `<name>.bak.<timestamp>` under `--replace`).
+     - When `--no-global-agents` / `--skip-global-agents` is passed, leaves all three global instruction files completely untouched even under `--replace`.
+  5. **Antigravity shadowing detection & backup (`~/.gemini/config/skills/` and `~/.gemini/config/plugins/`)**:
      - Checks `~/.gemini/config/skills/` for loose directories whose names collide with repo skills. Warns clearly if present; if `--replace` is passed, moves colliding directories into `~/.gemini/config/skills.bak.<timestamp>/` after verifying `skills.json` exposes valid replacement skills.
      - Checks `~/.gemini/config/plugins/` for non-marketplace local plugins (skipping plugins whose `installedFrom` field in `~/.gemini/config/config.json` is truthy) whose `skills/` subdirectories shadow repo skills. Warns without `--replace`; with `--replace`, refuses to move any plugin containing unmigrated skills not in the repo or non-skill runtime components (`mcp_config.json`, `hooks.json`, `hooks`, `sidecars`, `sidecars.json`), and backs up fully migrated shadowing plugins into `~/.gemini/config/plugins.bak.<timestamp>/`.
-- **`python3 init.py adopt <source-dir> --scope {shared,agy} [--force]`**:
-  - Copies a loose skill directory into `shared/<name>` or `harnesses/agy/<name>` (validating `SKILL.md` frontmatter) to streamline future skill development.
+- **`python3 init.py adopt <source-dir> --scope {shared,agy,claude,codex} [--force]`**:
+  - Copies a loose skill directory into `shared/<name>` or `harnesses/<harness>/<name>` (validating `SKILL.md` frontmatter and rejecting cross-scope duplicates or reserved harness entry names such as `synced` in `shared`/`claude`) to streamline future skill development.
 - **`python3 init.py doctor`**:
   - Exits non-zero if any check fails across the repo:
-    1. Every skill directory under `shared/*` and `harnesses/*/*` has a `SKILL.md` with valid YAML frontmatter (`name == dir.name`, non-empty `description`).
+    1. Every skill directory under `shared/*` and `harnesses/*/*` has a `SKILL.md` with valid YAML frontmatter (`name == dir.name`, non-empty `description`), no duplicates between `shared/` and a harness, and no reserved harness entry names (such as `synced` in `shared/` or `harnesses/claude/`).
     2. `global/AGENTS.md` exists inside a non-symlink `global/` directory as a non-symlink, non-empty UTF-8 regular file `<= 24,000` bytes.
     3. Every git-tracked symlink (e.g. `harnesses/agy/*/core`) and every relative markdown file link (`[label](./path)` or `[label](references/path)`) inside `.md` files resolves to an existing path inside the repository.
-    4. Zero hardcoded machine user paths (`/Users/<name>` or `/home/<name>`) appear anywhere in tracked `.md`, `.py`, or `.json` files.
+    4. Zero hardcoded machine user paths (`/Users/<name>` or `/home/<name>`) appear anywhere in tracked `.md`, `.py`, `.json`, or `.toml` files.
     5. All `.py` files pass `py_compile` syntax validation.
 
 ---

@@ -1176,7 +1176,7 @@ def test_doctor_frontmatter_duplicates_symlink_skills_and_bad_containers(tmp_pat
     sym_skill.unlink()
 
     # Valid unregistered future harness remains allowed
-    _write_skill(repo / "harnesses" / "claude" / "future-skill", description="Future harness.")
+    _write_skill(repo / "harnesses" / "cursor" / "future-skill", description="Future harness.")
     assert init.cmd_doctor(repo) == 0
 
     # Regular file at repo/shared or repo/harnesses must fail doctor
@@ -2178,3 +2178,723 @@ def test_doctor_validates_global_agents_md(tmp_path: Path) -> None:
     (ext_global / "AGENTS.md").write_text("# External\n", encoding="utf-8")
     (repo / "global").symlink_to(ext_global)
     assert init.cmd_doctor(repo) == 1
+
+
+# ---------------------------------------------------------------------------
+# Multi-harness (claude & codex) symlink farm, global rules, adopt & doctor tests
+# ---------------------------------------------------------------------------
+
+
+def _make_multi_harness_repo(repo_dir: Path) -> Path:
+    repo = _make_fake_repo(repo_dir)
+    _write_skill(
+        repo / "harnesses" / "claude" / "review",
+        description="Run Claude multi-agent code review.",
+    )
+    _write_skill(
+        repo / "harnesses" / "claude" / "dev-swarm",
+        description="Run Claude autonomous development swarm.",
+    )
+    _write_skill(
+        repo / "harnesses" / "codex" / "review",
+        description="Run Codex multi-agent code review.",
+    )
+    _write_skill(
+        repo / "harnesses" / "codex" / "dev-swarm",
+        description="Run Codex autonomous development swarm.",
+    )
+    return repo
+
+
+def test_multi_harness_fresh_apply_idempotent_and_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+    expected_global = (repo / "global" / "AGENTS.md").resolve()
+
+    # Before apply: status reports missing symlinks and not installed without creating home
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_before = capsys.readouterr().out
+    assert not home.exists()
+    assert "harness 'claude' skills (2): dev-swarm, review" in out_before
+    assert "harness 'codex' skills (2): dev-swarm, review" in out_before
+    assert "~/.claude/skills" in out_before
+    assert "~/.codex/skills" in out_before
+    assert out_before.count("missing symlinks (dev-swarm, hey, review)") == 2
+    assert "~/.claude/CLAUDE.md" in out_before and "not installed" in out_before
+    assert "~/.codex/AGENTS.md" in out_before and "not installed" in out_before
+
+    # Dry-run mutates nothing
+    assert init.main(["--repo", str(repo), "apply", "--dry-run", "--home", str(home)]) == 0
+    assert not home.exists()
+    capsys.readouterr()
+
+    # Live apply creates per-skill symlinks and global instruction links for all harnesses
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    capsys.readouterr()
+
+    for harness, global_name in (("claude", "CLAUDE.md"), ("codex", "AGENTS.md")):
+        skills_dir = home / f".{harness}" / "skills"
+        assert skills_dir.is_dir() and not skills_dir.is_symlink()
+        assert (skills_dir / "hey").is_symlink()
+        assert (skills_dir / "hey").resolve() == (repo / "shared" / "hey").resolve()
+        assert (skills_dir / "review").is_symlink()
+        assert (skills_dir / "review").resolve() == (
+            repo / "harnesses" / harness / "review"
+        ).resolve()
+        assert (skills_dir / "dev-swarm").is_symlink()
+        assert (skills_dir / "dev-swarm").resolve() == (
+            repo / "harnesses" / harness / "dev-swarm"
+        ).resolve()
+
+        global_link = home / f".{harness}" / global_name
+        assert global_link.is_symlink()
+        assert global_link.resolve() == expected_global
+
+    # Status reports configured and ok
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_after = capsys.readouterr().out
+    assert (
+        f"~/.claude/skills ({home / '.claude' / 'skills'}): configured (3 skill symlink(s))"
+        in out_after
+    )
+    assert (
+        f"~/.codex/skills ({home / '.codex' / 'skills'}): configured (3 skill symlink(s))"
+        in out_after
+    )
+    assert (
+        f"~/.claude/CLAUDE.md ({home / '.claude' / 'CLAUDE.md'}): "
+        f"ok (symlink -> {expected_global})" in out_after
+    )
+    assert (
+        f"~/.codex/AGENTS.md ({home / '.codex' / 'AGENTS.md'}): "
+        f"ok (symlink -> {expected_global})" in out_after
+    )
+
+    # Second apply is completely idempotent
+    before_second = _snapshot_tree(home)
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    out_second = capsys.readouterr().out
+    assert _snapshot_tree(home) == before_second
+    assert "already links all 3 skill(s)" in out_second
+
+    # Absent harnesses/claude and harnesses/codex still expose shared/* cleanly
+    home_shared_only = tmp_path / "home_shared_only"
+    repo_shared_only = _make_fake_repo(tmp_path / "repo_shared_only", include_agy_skills=False)
+    assert (
+        init.main(["--repo", str(repo_shared_only), "apply", "--home", str(home_shared_only)])
+        == 0
+    )
+    assert (home_shared_only / ".claude" / "skills" / "hey").resolve() == (
+        repo_shared_only / "shared" / "hey"
+    ).resolve()
+    assert (home_shared_only / ".codex" / "skills" / "hey").resolve() == (
+        repo_shared_only / "shared" / "hey"
+    ).resolve()
+
+
+def test_symlink_farm_preserves_builtin_and_unrelated_entries_across_replace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+
+    # Claude built-in synced/ directory and unrelated local skill + external symlink
+    claude_skills = home / ".claude" / "skills"
+    cloud_skill = claude_skills / "synced" / "cloud-builtin" / "SKILL.md"
+    cloud_skill.parent.mkdir(parents=True)
+    cloud_skill.write_text("# Cloud\n", encoding="utf-8")
+    _write_skill(claude_skills / "my-claude-local", description="Unrelated local Claude skill.")
+    ext_claude = _write_skill(tmp_path / "ext_claude" / "ext-tool", description="External tool.")
+    (claude_skills / "ext-tool").symlink_to(ext_claude)
+
+    # Codex built-in .system/ directory and unrelated local skill + external symlink
+    codex_skills = home / ".codex" / "skills"
+    sys_skill = codex_skills / ".system" / "codex-core" / "SKILL.md"
+    sys_skill.parent.mkdir(parents=True)
+    sys_skill.write_text("# System\n", encoding="utf-8")
+    _write_skill(codex_skills / "my-codex-local", description="Unrelated local Codex skill.")
+    ext_codex = _write_skill(tmp_path / "ext_codex" / "ext-codex-tool", description="External.")
+    (codex_skills / "ext-codex-tool").symlink_to(ext_codex)
+
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 0
+    capsys.readouterr()
+
+    assert cloud_skill.read_text(encoding="utf-8") == "# Cloud\n"
+    assert (claude_skills / "my-claude-local" / "SKILL.md").is_file()
+    assert (claude_skills / "ext-tool").is_symlink()
+    assert (claude_skills / "ext-tool").resolve() == ext_claude.resolve()
+    assert list((home / ".claude").glob("skills.bak.*")) == []
+
+    assert sys_skill.read_text(encoding="utf-8") == "# System\n"
+    assert (codex_skills / "my-codex-local" / "SKILL.md").is_file()
+    assert (codex_skills / "ext-codex-tool").is_symlink()
+    assert (codex_skills / "ext-codex-tool").resolve() == ext_codex.resolve()
+    assert list((home / ".codex").glob("skills.bak.*")) == []
+
+    # Status reports configured without flagging preserved or unrelated entries
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert "configured (3 skill symlink(s))" in out
+    assert "my-claude-local" not in out
+    assert "my-codex-local" not in out
+    assert "synced" not in out
+
+
+def test_symlink_farm_conflicts_backup_replace_rollback_and_container_conflicts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+
+    # Legacy real directory in ~/.claude/skills/dev-swarm and regular file at review
+    claude_skills = home / ".claude" / "skills"
+    _write_skill(claude_skills / "dev-swarm", description="Legacy local dev-swarm.")
+    (claude_skills / "dev-swarm" / "legacy.txt").write_text("keep-me", encoding="utf-8")
+    (claude_skills / "review").write_text("stray file", encoding="utf-8")
+
+    # External symlink in ~/.codex/skills/dev-swarm
+    ext_swarm = _write_skill(tmp_path / "claude_role" / "dev-swarm", description="External swarm.")
+    (ext_swarm / "ext.txt").write_text("untouched", encoding="utf-8")
+    codex_skills = home / ".codex" / "skills"
+    codex_skills.mkdir(parents=True)
+    (codex_skills / "dev-swarm").symlink_to(ext_swarm)
+
+    # Status reports conflicts
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_status = capsys.readouterr().out
+    assert "conflict (dev-swarm, review)" in out_status
+    assert "conflict (dev-swarm)" in out_status
+
+    # Apply without --replace fails and leaves conflicting paths untouched
+    rc_no_rep = init.main(["--repo", str(repo), "apply", "--home", str(home)])
+    err_no_rep = capsys.readouterr().err
+    assert rc_no_rep == 1
+    assert "CONFLICT:" in err_no_rep
+    assert not (claude_skills / "dev-swarm").is_symlink()
+    assert (claude_skills / "dev-swarm" / "legacy.txt").read_text(encoding="utf-8") == "keep-me"
+    assert (claude_skills / "review").read_text(encoding="utf-8") == "stray file"
+    assert (codex_skills / "dev-swarm").resolve() == ext_swarm.resolve()
+
+    # Dry-run --replace mutates nothing
+    before_dry = _snapshot_tree(home)
+    assert (
+        init.main(["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home)])
+        == 0
+    )
+    assert _snapshot_tree(home) == before_dry
+
+    # Rollback restores ~/.claude/skills/dev-swarm if symlink_to fails
+    with monkeypatch.context() as m:
+        real_symlink = Path.symlink_to
+
+        def fail_claude_swarm_link(self: Path, target: Path) -> None:
+            if self == claude_skills / "dev-swarm":
+                raise OSError("simulated symlink error")
+            real_symlink(self, target)
+
+        m.setattr(Path, "symlink_to", fail_claude_swarm_link)
+        rc_rb = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)])
+        assert rc_rb == 1
+        assert not (claude_skills / "dev-swarm").is_symlink()
+        assert (claude_skills / "dev-swarm" / "legacy.txt").read_text(encoding="utf-8") == "keep-me"
+
+    # Re-stage review conflict to verify single backup directory per harness on live --replace
+    assert (claude_skills / "review").is_symlink()
+    (claude_skills / "review").unlink()
+    (claude_skills / "review").write_text("stray file 2", encoding="utf-8")
+    assert (codex_skills / "dev-swarm").is_symlink()
+    (codex_skills / "dev-swarm").unlink()
+    (codex_skills / "dev-swarm").symlink_to(ext_swarm)
+
+    # Clear prior backup dirs from partial rollback run to verify clean single-dir backup below
+    for bak in list((home / ".claude").glob("skills.bak.*")) + list(
+        (home / ".codex").glob("skills.bak.*")
+    ):
+        init._rmtree_owned_dir(bak)
+
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 0
+    assert (claude_skills / "dev-swarm").resolve() == (
+        repo / "harnesses" / "claude" / "dev-swarm"
+    ).resolve()
+    assert (claude_skills / "review").resolve() == (
+        repo / "harnesses" / "claude" / "review"
+    ).resolve()
+    claude_baks = list((home / ".claude").glob("skills.bak.*"))
+    assert len(claude_baks) == 1
+    assert (claude_baks[0] / "dev-swarm" / "legacy.txt").read_text(encoding="utf-8") == "keep-me"
+    assert (claude_baks[0] / "review").read_text(encoding="utf-8") == "stray file 2"
+
+    assert (codex_skills / "dev-swarm").resolve() == (
+        repo / "harnesses" / "codex" / "dev-swarm"
+    ).resolve()
+    assert (ext_swarm / "ext.txt").read_text(encoding="utf-8") == "untouched"
+    codex_baks = list((home / ".codex").glob("skills.bak.*"))
+    assert len(codex_baks) == 1
+    assert (codex_baks[0] / "dev-swarm").is_symlink()
+
+    # Container conflict: symlink or regular file at ~/.claude/skills or ~/.codex/skills
+    home_cont = tmp_path / "home_cont"
+    (home_cont / ".claude").mkdir(parents=True)
+    ext_dir = tmp_path / "ext_skills_dir"
+    ext_dir.mkdir()
+    (ext_dir / "keep.txt").write_text("safe", encoding="utf-8")
+    (home_cont / ".claude" / "skills").symlink_to(ext_dir)
+    (home_cont / ".codex").mkdir(parents=True)
+    (home_cont / ".codex" / "skills").write_text("not-a-dir", encoding="utf-8")
+
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home_cont)]) == 0
+    out_cont = capsys.readouterr().out
+    assert "conflict (symlink ->" in out_cont
+    assert "conflict (non-directory file;" in out_cont
+
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home_cont)]) == 1
+    assert (home_cont / ".claude" / "skills").is_symlink()
+    assert (home_cont / ".codex" / "skills").read_text(encoding="utf-8") == "not-a-dir"
+
+    before_cont_dry = _snapshot_tree(home_cont)
+    assert (
+        init.main(
+            ["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home_cont)]
+        )
+        == 0
+    )
+    assert _snapshot_tree(home_cont) == before_cont_dry
+
+    # Container replacement rolls back original file if mkdir fails
+    with monkeypatch.context() as m:
+        real_mkdir = Path.mkdir
+
+        def fail_codex_mkdir(
+            self: Path, mode: int = 0o777, parents: bool = False, exist_ok: bool = False
+        ) -> None:
+            if self == home_cont / ".codex" / "skills":
+                raise OSError("simulated mkdir failure")
+            real_mkdir(self, mode=mode, parents=parents, exist_ok=exist_ok)
+
+        m.setattr(Path, "mkdir", fail_codex_mkdir)
+        assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home_cont)]) == 1
+        assert (home_cont / ".codex" / "skills").read_text(encoding="utf-8") == "not-a-dir"
+
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home_cont)]) == 0
+    claude_cont_dir = home_cont / ".claude" / "skills"
+    codex_cont_dir = home_cont / ".codex" / "skills"
+    assert claude_cont_dir.is_dir() and not claude_cont_dir.is_symlink()
+    assert (claude_cont_dir / "hey").resolve() == (repo / "shared" / "hey").resolve()
+    assert (ext_dir / "keep.txt").read_text(encoding="utf-8") == "safe"
+    assert codex_cont_dir.is_dir() and not codex_cont_dir.is_symlink()
+    assert (codex_cont_dir / "hey").resolve() == (repo / "shared" / "hey").resolve()
+    codex_file_baks = list((home_cont / ".codex").glob("skills.bak.*"))
+    assert len(codex_file_baks) == 1
+    assert codex_file_baks[0].read_text(encoding="utf-8") == "not-a-dir"
+
+
+def test_symlink_farm_prunes_only_stale_repo_symlinks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+
+    claude_skills = home / ".claude" / "skills"
+    codex_skills = home / ".codex" / "skills"
+
+    # Stale broken symlink pointing into <repo>/shared/removed-skill
+    (claude_skills / "removed-skill").symlink_to(repo / "shared" / "removed-skill")
+    # Stale relative symlink pointing into <repo>/harnesses/codex/old-skill
+    rel_to_repo = os.path.relpath(repo / "harnesses" / "codex" / "old-skill", codex_skills)
+    (codex_skills / "old-skill").symlink_to(rel_to_repo)
+
+    # External symlinks (live, broken, and sibling-prefix repo-extra) must NOT be pruned
+    outside_live = _write_skill(tmp_path / "repo-extra" / "keep-sibling", description="Sibling.")
+    (claude_skills / "keep-sibling").symlink_to(outside_live)
+    (claude_skills / "broken-external").symlink_to(tmp_path / "outside" / "gone")
+    # Hidden symlink pointing into repo is preserved (hidden entries untouched)
+    (codex_skills / ".hidden-link").symlink_to(repo / "shared" / "removed-skill")
+
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_st = capsys.readouterr().out
+    assert "stale repo symlinks (removed-skill)" in out_st
+    assert "stale repo symlinks (old-skill)" in out_st
+    assert "keep-sibling" not in out_st
+    assert "broken-external" not in out_st
+
+    # Dry-run previews removal without mutating anything
+    before_dry = _snapshot_tree(home)
+    assert init.main(["--repo", str(repo), "apply", "--dry-run", "--home", str(home)]) == 0
+    out_dry = capsys.readouterr().out
+    assert _snapshot_tree(home) == before_dry
+    assert "Would remove stale symlink" in out_dry
+
+    # Live apply prunes only stale repo symlinks
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    assert not (claude_skills / "removed-skill").is_symlink()
+    assert not (codex_skills / "old-skill").is_symlink()
+    assert (claude_skills / "keep-sibling").is_symlink()
+    assert (claude_skills / "broken-external").is_symlink()
+    assert (codex_skills / ".hidden-link").is_symlink()
+
+    capsys.readouterr()
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out_clean = capsys.readouterr().out
+    assert "stale repo symlinks" not in out_clean
+    assert "configured (3 skill symlink(s))" in out_clean
+
+
+def test_no_global_agents_skips_all_three_harnesses_even_under_replace(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+    targets = (
+        home / ".gemini" / "config" / "AGENTS.md",
+        home / ".claude" / "CLAUDE.md",
+        home / ".codex" / "AGENTS.md",
+    )
+
+    # Fresh home: --no-global-agents and --skip-global-agents create none of the 3 files
+    for flag in ("--no-global-agents", "--skip-global-agents"):
+        assert init.main(["--repo", str(repo), "apply", flag, "--home", str(home)]) == 0
+        for path in targets:
+            assert not path.exists() and not path.is_symlink()
+
+    # Pre-existing custom files at all 3 locations remain completely untouched under --replace
+    for idx, path in enumerate(targets):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"# Custom rules {idx}\n", encoding="utf-8")
+
+    # Without --no-global-agents and without --replace, all 3 fail with CONFLICT
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 1
+    capsys.readouterr()
+
+    for flag in ("--no-global-agents", "--skip-global-agents"):
+        rc = init.main(["--repo", str(repo), "apply", "--replace", flag, "--home", str(home)])
+        assert rc == 0
+        for idx, path in enumerate(targets):
+            assert not path.is_symlink()
+            assert path.read_text(encoding="utf-8") == f"# Custom rules {idx}\n"
+            assert list(path.parent.glob(f"{path.name}.bak.*")) == []
+
+    # Live --replace without opt-out backs up and symlinks all 3
+    expected_global = (repo / "global" / "AGENTS.md").resolve()
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 0
+    for idx, path in enumerate(targets):
+        assert path.is_symlink()
+        assert path.resolve() == expected_global
+        baks = list(path.parent.glob(f"{path.name}.bak.*"))
+        assert len(baks) == 1
+        assert baks[0].read_text(encoding="utf-8") == f"# Custom rules {idx}\n"
+
+
+def test_adopt_claude_codex_and_reserved_synced_guards(tmp_path: Path) -> None:
+    repo = _make_fake_repo(tmp_path / "repo")
+    (repo / "core" / "review").mkdir(parents=True)
+    (repo / "core" / "review" / "algorithm.md").write_text("# Algorithm\n", encoding="utf-8")
+
+    # Adopting same skill name ('review') into claude and codex coexists with harnesses/agy/review
+    src_claude = _write_skill(tmp_path / "src_claude" / "review", description="Claude review.")
+    (src_claude / "core").symlink_to("../../../core/review")
+    src_codex = _write_skill(tmp_path / "src_codex" / "review", description="Codex review.")
+    (src_codex / "core").symlink_to("../../../core/review")
+
+    assert init.main(["--repo", str(repo), "adopt", str(src_claude), "--scope", "claude"]) == 0
+    assert init.main(["--repo", str(repo), "adopt", str(src_codex), "--scope", "codex"]) == 0
+    assert (repo / "harnesses" / "claude" / "review" / "SKILL.md").is_file()
+    assert (repo / "harnesses" / "codex" / "review" / "SKILL.md").is_file()
+    assert init.cmd_doctor(repo) == 0
+
+    # Cross-scope duplicate with shared/hey is rejected for claude and codex
+    dup_hey = _write_skill(tmp_path / "dup" / "hey", description="Duplicate hey.")
+    assert init.main(["--repo", str(repo), "adopt", str(dup_hey), "--scope", "claude"]) == 1
+    assert init.main(["--repo", str(repo), "adopt", str(dup_hey), "--scope", "codex"]) == 1
+
+    # Reserved skill name 'synced' is rejected by adopt and doctor for shared/ and harnesses/claude/
+    synced_src = _write_skill(tmp_path / "res" / "synced", description="Collides with synced.")
+    assert init.main(["--repo", str(repo), "adopt", str(synced_src), "--scope", "shared"]) == 1
+    assert init.main(["--repo", str(repo), "adopt", str(synced_src), "--scope", "claude"]) == 1
+
+    _write_skill(repo / "harnesses" / "claude" / "synced", description="Bad synced.")
+    assert init.cmd_doctor(repo) == 1
+    init._rmtree_owned_dir(repo / "harnesses" / "claude" / "synced")
+
+    _write_skill(repo / "shared" / "synced", description="Bad shared synced.")
+    assert init.cmd_doctor(repo) == 1
+    init._rmtree_owned_dir(repo / "shared" / "synced")
+    assert init.cmd_doctor(repo) == 0
+
+
+def test_symlink_farm_validation_overlap_and_bad_ancestor_guards(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 1. Invalid repo skill or duplicate name does not strand existing user skill
+    home = tmp_path / "home"
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+    (repo / "harnesses" / "claude" / "review" / "SKILL.md").write_text(
+        "---\nname: review\ndescription:\n---\n", encoding="utf-8"
+    )
+    _write_skill(repo / "harnesses" / "claude" / "hey", description="Duplicate hey.")
+    claude_skills = home / ".claude" / "skills"
+    _write_skill(claude_skills / "review", description="Existing user review.")
+    _write_skill(claude_skills / "hey", description="Existing user hey.")
+
+    rc = init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "duplicated in both shared/ and harnesses/claude/" in err
+    assert "failed validation" in err
+    assert (claude_skills / "review" / "SKILL.md").is_file()
+    assert not (claude_skills / "review").is_symlink()
+    assert (claude_skills / "hey" / "SKILL.md").is_file()
+    assert not (claude_skills / "hey").is_symlink()
+    assert list((home / ".claude").glob("skills.bak.*")) == []
+
+    # 2. Repo cloned inside ~/.claude/skills/agent-skills is rejected; ~/.claude/agent-skills works
+    home_ov = tmp_path / "home_ov"
+    repo_ov = _make_multi_harness_repo(home_ov / ".claude" / "skills" / "agent-skills")
+    assert init.main(["--repo", str(repo_ov), "apply", "--replace", "--home", str(home_ov)]) == 1
+    assert (repo_ov / "shared" / "hey" / "SKILL.md").is_file()
+
+    home_sib = tmp_path / "home_sib"
+    repo_sib = _make_multi_harness_repo(home_sib / ".claude" / "agent-skills")
+    assert init.main(["--repo", str(repo_sib), "apply", "--home", str(home_sib)]) == 0
+    assert (home_sib / ".claude" / "skills" / "hey").resolve() == (
+        repo_sib / "shared" / "hey"
+    ).resolve()
+
+    # 3. Broken ancestor at ~/.gemini does not hide claude/codex status; bad ~/.claude fails apply
+    home_bad = tmp_path / "home_bad"
+    home_bad.mkdir()
+    (home_bad / ".gemini").write_text("file", encoding="utf-8")
+    (home_bad / ".claude").write_text("file", encoding="utf-8")
+    good_repo = _make_multi_harness_repo(tmp_path / "good_repo")
+    capsys.readouterr()
+    assert init.main(["--repo", str(good_repo), "status", "--home", str(home_bad)]) == 0
+    out_bad = capsys.readouterr().out
+    assert "~/.claude/skills" in out_bad and "invalid (non-directory ancestor" in out_bad
+    assert "~/.codex/skills" in out_bad and "missing symlinks" in out_bad
+    assert init.main(["--repo", str(good_repo), "apply", "--dry-run", "--home", str(home_bad)]) == 1
+    assert init.main(["--repo", str(good_repo), "apply", "--home", str(home_bad)]) == 1
+
+
+def test_symlink_farm_symlinked_config_dir_and_repo_root_not_pruned(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    repo = _make_multi_harness_repo(home / "agent-skills")
+
+    # Dotfile-symlinked ~/.claude -> <dotfiles>/claude with relative external symlinks
+    dotfiles = tmp_path / "dotfiles"
+    claude_real = dotfiles / "claude"
+    claude_skills = claude_real / "skills"
+    claude_skills.mkdir(parents=True)
+    ext_skill = _write_skill(dotfiles / "agent-skills" / "ext", description="External dotfile.")
+    (claude_skills / "ext").symlink_to("../../agent-skills/ext")
+    (claude_skills / "ext-broken").symlink_to("../../agent-skills/ext-missing")
+    # Symlink pointing to repo_root itself (not a descendant skill) must not be pruned
+    (claude_skills / "repo-root-link").symlink_to(repo)
+    (home / ".claude").symlink_to(claude_real)
+
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home)]) == 0
+    capsys.readouterr()
+    assert (claude_skills / "ext").is_symlink()
+    assert (claude_skills / "ext").resolve() == ext_skill.resolve()
+    assert (claude_skills / "ext-broken").is_symlink()
+    assert (claude_skills / "repo-root-link").is_symlink()
+    assert (claude_skills / "repo-root-link").resolve() == repo.resolve()
+
+    assert init.main(["--repo", str(repo), "status", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert "stale repo symlinks" not in out
+    assert "configured (3 skill symlink(s))" in out
+
+
+def test_symlink_farm_dry_run_parity_via_virtual_agents_skills(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+
+    # Case 1: ~/.agents/skills is a real dir with an unmigrated skill referenced by ~/.claude/skills
+    home1 = tmp_path / "home1"
+    _write_skill(home1 / ".agents" / "skills" / "unmigrated", description="Unmigrated local.")
+    claude1 = home1 / ".claude" / "skills"
+    claude1.mkdir(parents=True)
+    (claude1 / "unmigrated").symlink_to("../../.agents/skills/unmigrated")
+
+    # Without --replace, ~/.agents/skills conflicts so neither dry-run nor live prunes unmigrated
+    before1 = _snapshot_tree(home1)
+    assert init.main(["--repo", str(repo), "apply", "--dry-run", "--home", str(home1)]) == 1
+    out1_no_rep = capsys.readouterr().out
+    assert "Would remove stale symlink" not in out1_no_rep
+    assert _snapshot_tree(home1) == before1
+
+    # With --replace, dry-run predicts pruning unmigrated (matching live --replace)
+    assert (
+        init.main(["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home1)])
+        == 0
+    )
+    out1_dry_rep = capsys.readouterr().out
+    assert "Would remove stale symlink" in out1_dry_rep and "unmigrated" in out1_dry_rep
+    assert _snapshot_tree(home1) == before1
+
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home1)]) == 0
+    assert not (claude1 / "unmigrated").is_symlink()
+
+    # Case 2: ~/.agents/skills absent, ~/.claude/skills/hey -> ../../.agents/skills/hey (in shared/)
+    home2 = tmp_path / "home2"
+    claude2 = home2 / ".claude" / "skills"
+    claude2.mkdir(parents=True)
+    (claude2 / "hey").symlink_to("../../.agents/skills/hey")
+
+    before2 = _snapshot_tree(home2)
+    assert init.main(["--repo", str(repo), "apply", "--dry-run", "--home", str(home2)]) == 0
+    err2_dry = capsys.readouterr().err
+    assert "CONFLICT:" not in err2_dry
+    assert _snapshot_tree(home2) == before2
+
+    assert init.main(["--repo", str(repo), "apply", "--home", str(home2)]) == 0
+    assert (claude2 / "hey").is_symlink()
+    assert (claude2 / "hey").resolve() == (repo / "shared" / "hey").resolve()
+    assert list((home2 / ".claude").glob("skills.bak.*")) == []
+
+
+def test_symlink_farm_refuses_container_replace_on_invalid_repo_and_handles_empty_or_unreadable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # 1. Invalid or duplicate repo skill prevents replacing conflicting skills_dir container
+    home = tmp_path / "home"
+    repo = _make_multi_harness_repo(tmp_path / "repo")
+    (repo / "harnesses" / "claude" / "review" / "SKILL.md").write_text(
+        "---\nname: review\ndescription:\n---\n", encoding="utf-8"
+    )
+    _write_skill(repo / "harnesses" / "codex" / "hey", description="Duplicate hey.")
+
+    ext_dir = tmp_path / "ext_working_skills"
+    ext_dir.mkdir()
+    (ext_dir / "keep.txt").write_text("intact", encoding="utf-8")
+    (home / ".claude").mkdir(parents=True)
+    (home / ".claude" / "skills").symlink_to(ext_dir)
+    (home / ".codex").mkdir(parents=True)
+    (home / ".codex" / "skills").write_text("existing-file", encoding="utf-8")
+
+    before_dry = _snapshot_tree(home)
+    assert (
+        init.main(["--repo", str(repo), "apply", "--dry-run", "--replace", "--home", str(home)])
+        == 1
+    )
+    err_dry = capsys.readouterr().err
+    assert "refusing to replace" in err_dry
+    assert _snapshot_tree(home) == before_dry
+
+    assert init.main(["--repo", str(repo), "apply", "--replace", "--home", str(home)]) == 1
+    err_live = capsys.readouterr().err
+    assert "refusing to replace" in err_live
+    assert (home / ".claude" / "skills").is_symlink()
+    assert (home / ".claude" / "skills").resolve() == ext_dir.resolve()
+    assert (home / ".codex" / "skills").read_text(encoding="utf-8") == "existing-file"
+    assert list((home / ".claude").glob("skills.bak.*")) == []
+    assert list((home / ".codex").glob("skills.bak.*")) == []
+
+    # 2. Container replacement with 0 desired skills does not print "already links all 0 skill(s)"
+    empty_repo = tmp_path / "empty_repo"
+    (empty_repo / "shared").mkdir(parents=True)
+    (empty_repo / "global").mkdir(parents=True)
+    (empty_repo / "global" / "AGENTS.md").write_text("# Global\n", encoding="utf-8")
+    home_empty = tmp_path / "home_empty"
+    (home_empty / ".claude").mkdir(parents=True)
+    (home_empty / ".claude" / "skills").write_text("file", encoding="utf-8")
+
+    capsys.readouterr()
+    assert (
+        init.main(["--repo", str(empty_repo), "apply", "--replace", "--home", str(home_empty)])
+        == 0
+    )
+    out_empty = capsys.readouterr().out
+    assert (home_empty / ".claude" / "skills").is_dir()
+    assert f"OK: {home_empty / '.claude' / 'skills'} already links all 0 skill(s)" not in out_empty
+
+    # 3. Unreadable shared/ reports invalid repo target in status rather than stale repo symlinks
+    if os.geteuid() != 0:
+        home_unr = tmp_path / "home_unr"
+        repo_unr = _make_multi_harness_repo(tmp_path / "repo_unr")
+        assert init.main(["--repo", str(repo_unr), "apply", "--home", str(home_unr)]) == 0
+        os.chmod(repo_unr / "shared", 0o000)
+        try:
+            capsys.readouterr()
+            assert init.main(["--repo", str(repo_unr), "status", "--home", str(home_unr)]) == 0
+            out_unr = capsys.readouterr().out
+            assert "invalid repo target" in out_unr
+            assert "stale repo symlinks" not in out_unr
+        finally:
+            os.chmod(repo_unr / "shared", 0o755)
+
+
+def test_real_repo_apply_and_status_exposes_all_12_skills_and_core_symlinks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    home = tmp_path / "home"
+    assert init.main(["--repo", str(REAL_REPO), "apply", "--home", str(home)]) == 0
+    capsys.readouterr()
+
+    assert (home / ".agents" / "skills").is_symlink()
+    assert (home / ".agents" / "skills").resolve() == (REAL_REPO / "shared").resolve()
+
+    expected_claude = {
+        "hey": REAL_REPO / "shared" / "hey",
+        "mujoco-deformables": REAL_REPO / "shared" / "mujoco-deformables",
+        "dev-swarm": REAL_REPO / "harnesses" / "claude" / "dev-swarm",
+        "dev-swarm-zircon": REAL_REPO / "harnesses" / "claude" / "dev-swarm-zircon",
+        "review": REAL_REPO / "harnesses" / "claude" / "review",
+    }
+    expected_codex = {
+        "hey": REAL_REPO / "shared" / "hey",
+        "mujoco-deformables": REAL_REPO / "shared" / "mujoco-deformables",
+        "claude-review": REAL_REPO / "harnesses" / "codex" / "claude-review",
+        "dev-swarm": REAL_REPO / "harnesses" / "codex" / "dev-swarm",
+        "dev-swarm-zircon": REAL_REPO / "harnesses" / "codex" / "dev-swarm-zircon",
+        "review": REAL_REPO / "harnesses" / "codex" / "review",
+    }
+
+    for harness, expected in (("claude", expected_claude), ("codex", expected_codex)):
+        skills_dir = home / f".{harness}" / "skills"
+        entries = sorted(p.name for p in skills_dir.iterdir())
+        assert entries == sorted(expected)
+        for name, target in expected.items():
+            link = skills_dir / name
+            assert link.is_symlink()
+            assert link.resolve(strict=True) == target.resolve()
+            if name in {"dev-swarm", "dev-swarm-zircon", "review"}:
+                assert (link / "core").is_symlink()
+                assert (link / "core").resolve(strict=True) == (REAL_REPO / "core" / name).resolve()
+
+    expected_global = (REAL_REPO / "global" / "AGENTS.md").resolve()
+    for link in (
+        home / ".gemini" / "config" / "AGENTS.md",
+        home / ".claude" / "CLAUDE.md",
+        home / ".codex" / "AGENTS.md",
+    ):
+        assert link.is_symlink()
+        assert link.resolve(strict=True) == expected_global
+
+    assert init.main(["--repo", str(REAL_REPO), "status", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert "configured (5 skill symlink(s))" in out
+    assert "configured (6 skill symlink(s))" in out
+    assert f"~/.claude/CLAUDE.md ({home / '.claude' / 'CLAUDE.md'}): ok (symlink ->" in out
+    assert f"~/.codex/AGENTS.md ({home / '.codex' / 'AGENTS.md'}): ok (symlink ->" in out
+
+
+def test_doctor_scans_toml_files_for_hardcoded_user_paths(tmp_path: Path) -> None:
+    repo = _make_fake_repo(tmp_path / "repo")
+    toml_file = repo / "shared" / "hey" / "config.toml"
+    bad_path = "/" + "Users" + "/alice/private/tool.py"
+    toml_file.write_text(f'path = "{bad_path}"\n', encoding="utf-8")
+    assert init.cmd_doctor(repo) == 1
+
+    toml_file.write_text('path = "~/.codex/skills/hey/tool.py"\n', encoding="utf-8")
+    assert init.cmd_doctor(repo) == 0
