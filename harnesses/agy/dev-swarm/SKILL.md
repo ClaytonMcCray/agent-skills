@@ -3,13 +3,13 @@ name: dev-swarm
 description: >-
   Autonomous local development swarm orchestrated by the lead agent over the
   native Swarm Board. Runs an exterior task loop and interior pipeline of
-  Researcher (Neon xhigh), Planner (Carbon High) <-> parallel cross-family
-  Critic (Carbon High + Opus 5.5 High when quota allows), parallel or single
-  Coder (Neon xhigh, escalating failures to Carbon High) <-> paired Reviewer
-  (Carbon High using the /review skill), and an air-gapped Commit Reviewer
-  (Carbon High) -> Commit Writer (Carbon High) stage. Use when the user invokes
-  /dev-swarm or asks to run the full multi-agent development swarm on a goal or
-  task.
+  Researcher (Carbon High broad / Neon xhigh deep), Planner (Carbon High) <->
+  parallel cross-family Critic (Carbon High + Opus 5.5 High when quota allows),
+  parallel or single Coder (Neon xhigh, escalating failures to Carbon High) <->
+  paired Reviewer (Carbon High using the /review skill), and an air-gapped
+  Commit Reviewer (Carbon High) -> Commit Writer (Carbon High) stage. Use when
+  the user invokes /dev-swarm or asks to run the full multi-agent development
+  swarm on a goal or task.
 ---
 
 # Autonomous Development Swarm (`/dev-swarm` — Antigravity Adapter)
@@ -31,11 +31,11 @@ Resolve exact model IDs and quota once at Step 0 via `swarm{action: "models", al
 
 | Tier Variable | Match Rule (Case-Insensitive) | Bound `algorithm.md` Personas |
 | :--- | :--- | :--- |
-| **`NEON_XHIGH`** | `Neon` + `xhigh` / `XHigh` / `Extra High` | `Researcher-Broad`, `Researcher-Deep`, `Coder` |
-| **`CARBON_HIGH`** | `Carbon` + `High` (e.g. `Gemini 4 Carbon (High)`) | `Planner`, primary `Critic` (`critic-carbon-k`), `Reviewer`, `Commit-Reviewer`, `Commit-Writer` |
+| **`CARBON_HIGH`** | `Carbon` + `High` (e.g. `Gemini 4 Carbon (High)`) | `Researcher-Broad`, `Planner`, primary `Critic` (`critic-carbon-k`), `Reviewer`, `Commit-Reviewer`, `Commit-Writer` |
+| **`NEON_XHIGH`** | `Neon` + `xhigh` / `XHigh` / `Extra High` | `Researcher-Deep`, `Coder` |
 | **`OPUS_HIGH`** | `Opus` + `5.5` + `High` (or closest high-thinking `Opus`, logged in `DECISION_LEDGER`) | Parallel cross-family `Critic` (`critic-opus-k`, spawned alongside `critic-carbon-k` whenever `OPUS_HIGH` quota `> 0%`; if `0%`, run `critic-carbon-k` alone) |
 
-- **Capability Escalation (distinct from quota fallback)**: Never re-run a failed/thin `NEON_XHIGH` `Researcher` or `Coder` on the same brief—`kill` it, reset an isolated `/tmp` `<WORKTREE_PATH>` (or document prior partial edits in-place), spawn a fresh retry-suffixed **`CARBON_HIGH`** worker (`res-k-r<r>`, `coder-k[-j]-r<r>`) with the original brief plus a concise failure summary, and notify the waiting `reviewer-k[-j]` of the new `<PAIRED_CODER>` name. On `CARBON_HIGH`/`OPUS_HIGH` retries, check for a higher effort tier or spawn a fresh retry-suffixed worker narrowed to the disputed sites. Pinning `Commit-Reviewer` to `CARBON_HIGH` prevents `NEON_XHIGH` code from ever being audited solely by `NEON_XHIGH`; if `Coder` escalates to `CARBON_HIGH`, either cross-pin the waiting `reviewer-k[-j]` in place via `SWITCH_MODEL` (`swarm{action: "model", name: "<reviewer>", model: "<OPUS_HIGH>"}`) if `OPUS_HIGH` quota allows, or disclose the shared `CARBON_HIGH` review in the final report.
+- **Capability Escalation (distinct from quota fallback)**: Never re-run a failed/thin `NEON_XHIGH` `Researcher-Deep` or `Coder` on the same brief—`kill` it, reset an isolated `/tmp` `<WORKTREE_PATH>` (or document prior partial edits in-place), spawn a fresh retry-suffixed **`CARBON_HIGH`** worker (`res-deep-k-r<r>`, `coder-k[-j]-r<r>`) with the original brief plus a concise failure summary, and notify the waiting `reviewer-k[-j]` of the new `<PAIRED_CODER>` name. On `CARBON_HIGH`/`OPUS_HIGH` retries (including `Researcher-Broad`), check for a higher effort tier or spawn a fresh retry-suffixed worker narrowed to the disputed sites. Pinning `Commit-Reviewer` to `CARBON_HIGH` prevents `NEON_XHIGH` code from ever being audited solely by `NEON_XHIGH`; if `Coder` escalates to `CARBON_HIGH`, either cross-pin the waiting `reviewer-k[-j]` in place via `SWITCH_MODEL` (`swarm{action: "model", name: "<reviewer>", model: "<OPUS_HIGH>"}`) if `OPUS_HIGH` quota allows, or disclose the shared `CARBON_HIGH` review in the final report.
 - **Cheap search subagent routing**: Route narrow search-shaped lookups (*"every caller of X"*, *"where is Y configured"*) to `invoke_subagent{TypeName: "research", Model: "flash"}` instead of spawning a full frontier swarm worker.
 - **Quota fallback & cross-pin (`SWITCH_MODEL`)**: Use `swarm{action: "model", name: "<worker>", model: "<other_pin>"}` to move waiting workers across `OPUS_HIGH <-> NEON_XHIGH <-> CARBON_HIGH` on quota exhaustion (or to cross-pin a waiting `Reviewer` to `OPUS_HIGH` upon `Coder` capability escalation), recording substitutions in the final report. **Never** downgrade core roles to `flash` or `flash_lite`.
 - **Disabled `swarm` plugin**: Tell the user `/dev-swarm` requires [swarm](customization://swarm) for per-role frontier pinning and ask whether to enable it first.

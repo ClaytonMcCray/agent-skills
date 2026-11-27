@@ -30,12 +30,12 @@ Resolve exact model IDs once at Step 0 via `swarm{action: "models", all: true}`:
 
 | Tier Variable | Match Rule (Case-Insensitive) | Bound `algorithm.md` Personas |
 | :--- | :--- | :--- |
-| **`NEON_XHIGH`** | `Neon` + `xhigh` / `XHigh` / `Extra High` | `Researcher` (x2), `Zircon-Coder` (default writer) |
-| **`CARBON_HIGH`** | `Carbon` + `High` (e.g. `Gemini 4 Carbon (High)`) | `Planner`, `Critic-1` (`critic-carbon-k`), `Zircon-Coder-Escalation`, `Zircon-Parity-Reviewer`, `Zircon-Safety-Reviewer`, and optional Stage 6 `Commit-Reviewer` / `Commit-Writer` |
+| **`CARBON_HIGH`** | `Carbon` + `High` (e.g. `Gemini 4 Carbon (High)`) | `Researcher` (`res-k-1` broad Rust port conventions + full C++ inventory), `Planner`, `Critic-1` (`critic-carbon-k`), `Zircon-Coder-Escalation`, `Zircon-Parity-Reviewer`, `Zircon-Safety-Reviewer`, and optional Stage 6 `Commit-Reviewer` / `Commit-Writer` |
+| **`NEON_XHIGH`** | `Neon` + `xhigh` / `XHigh` / `Extra High` | `Researcher` (`res-k-2` narrow exhaustive C++ function/comment/lock/UB inventory), `Zircon-Coder` (default writer) |
 | **`OPUS_HIGH`** | `Opus` + `5.5` + `High` (or closest high-thinking `Opus`) | Parallel `Critic-2` (`critic-opus-k`, spawned alongside `critic-carbon-k` when quota `> 0%`) |
 
 - **Cross-model review guarantee**: Pinning `Zircon-Parity-Reviewer`, `Zircon-Safety-Reviewer`, and optional Stage 6 `Commit-Reviewer` to `CARBON_HIGH` prevents `NEON_XHIGH` code from ever being audited solely by `NEON_XHIGH`.
-- **Coder escalation**: After a thin or failed attempt by `Zircon-Coder`, `kill` it and spawn a fresh escalation worker pinned to `CARBON_HIGH` with the same brief plus what failed.
+- **Coder & inventory escalation**: After a thin or failed attempt by a `NEON_XHIGH` worker (`res-k-2` or `Zircon-Coder`), `kill` it and spawn a fresh escalation worker pinned to `CARBON_HIGH` with the same brief plus what failed.
 - **Safety escalation**: On safety disagreement, data races, raw-pointer aliasing, or FFI ownership transfer, spawn a fresh `Zircon-Safety-Reviewer` on `CARBON_HIGH` (or higher Carbon effort tier if listed by `models`) narrowed to the disputed sites.
 - **Quota fallback (`SWITCH_MODEL`)**: Move waiting workers in place via `swarm{action: "model", name: "<worker>", model: "<other_pin>"}` across `OPUS_HIGH <-> NEON_XHIGH <-> CARBON_HIGH` and record substitutions in the final report. **Never** downgrade core roles to `flash` or `flash_lite`.
 - **Disabled `swarm` plugin**: Tell the user `/dev-swarm-zircon` requires [swarm](customization://swarm) for per-role frontier pinning and ask whether to enable it first.
@@ -43,7 +43,7 @@ Resolve exact model IDs once at Step 0 via `swarm{action: "models", all: true}`:
 ## Per-Unit Naming (`-k`), Lean Roster & Board Mechanics
 
 Killed `swarm` names cannot be reused in the same conversation, so suffix workers by unit $k$ and review round $r$ (all names `<= 24` chars):
-- Stage 1: `res-k-1`, `res-k-2` (`NEON_XHIGH`).
+- Stage 1: `res-k-1` (`CARBON_HIGH`) and `res-k-2` (`NEON_XHIGH`) in parallel for cross-model inventory verification.
 - Stage 2: optional `planner-k` (`CARBON_HIGH`), `critic-carbon-k` (`CARBON_HIGH`), parallel `critic-opus-k` (`OPUS_HIGH` when quota `> 0%`).
 - Stage 3: `zircon-coder-k` (`NEON_XHIGH`; escalation `zircon-coder-k-cb` on `CARBON_HIGH`).
 - Stage 4/5: `z-parity-k-p<r>`, `z-safety-k-p<r>` (safety escalation `z-safety-k-p<r>-esc`).
